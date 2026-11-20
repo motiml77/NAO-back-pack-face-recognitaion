@@ -77,7 +77,7 @@ class Link {
   // small control message (ping, settings)
   async send(obj) {
     const res = await fetch(`${RELAY}/${this.topic}`, { method: "POST", body: await this.sealJson(obj) });
-    if (!res.ok) throw new Error(`שגיאת רשת (${res.status})`);
+    if (!res.ok) throw Object.assign(new Error(`שגיאת רשת (${res.status})`), { status: res.status });
   }
 
   // a document to print: encrypted file as attachment + encrypted description as the message
@@ -88,7 +88,8 @@ class Link {
     if (!res.ok) {
       let detail = "";
       try { detail = (await res.json()).error || ""; } catch {}
-      throw new Error(`השליחה נכשלה (${res.status}) ${detail}`);
+      const busy = res.status === 429 ? "שירות ההעברה עמוס, נסו שוב בעוד דקה." : "";
+      throw Object.assign(new Error(busy || `השליחה נכשלה (${res.status}) ${detail}`), { status: res.status });
     }
   }
 
