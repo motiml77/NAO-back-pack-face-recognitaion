@@ -14,6 +14,7 @@ export const PRESETS = [
   { key: "niftar",    label: "לעילוי נשמת",    title: "לעילוי נשמת",    footer: "ת.נ.צ.ב.ה" },
   { key: "refua",     label: "לרפואה שלמה",    title: "לרפואה שלמה",    footer: "בתוך שאר חולי ישראל" },
   { key: "hatzlacha", label: "להצלחה ופרנסה", title: "להצלחה ופרנסה", footer: "" },
+  { key: "zera",      label: "לזרעא בר קיימא", title: "לזרעא בר קיימא", footer: "" },
   { key: "custom",    label: "נוסח אישי",       title: "",               footer: "" },
 ];
 
