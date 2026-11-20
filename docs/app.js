@@ -1,11 +1,13 @@
 import { connect, fromSaved } from "./link.js";
-import { loadAssets, drawPage, cleanLines, canvasToPdf, STYLES, MAX_LINES } from "./render.js";
+import { loadAssets, drawPage, cleanLines, canvasToPdf, PRESETS, MAX_TITLE_LINES, MAX_NAME_LINES } from "./render.js";
 
 const $ = (id) => document.getElementById(id);
 const SAVED_KEY = "rp-link";
 const JOBS_KEY = "rp-jobs";
 const MAX_FILE = 15 * 1024 * 1024;
-const PRINT_W = 2339, PRINT_H = 1654;   // 200 dpi A4 landscape
+const PRINT_W = 2339, PRINT_H = 1654;      // 200 dpi A4 landscape
+const PONG_TIMEOUT = 12000;
+const RECHECK_EVERY = 2 * 60 * 1000;
 
 const store = {
   get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
@@ -15,42 +17,98 @@ const store = {
 
 let link = null;
 let events = null;
-let style = STYLES[0];
 let assetsReady = null;
+let health = null;          // last answer from the printer computer
 let lastPong = 0;
 let pongTimer = null;
+let wordOnPc = true;
+let raf = 0;
 
-// ---------------------------------------------------------------- status pill
-function setStatus(kind, text) {
-  $("statusPill").hidden = false;
-  $("statusDot").className = "dot " + kind;
-  $("statusText").textContent = text;
+// ================================================================ printer-ready button
+function setReady(kind, icon, big, small) {
+  $("ready").className = "ready " + kind;
+  $("readyIcon").textContent = icon;
+  $("readyBig").textContent = big;
+  $("readySmall").textContent = small;
 }
 
-// ---------------------------------------------------------------- jobs list
-const STATE_TEXT = {
-  sent: "⏳ נשלח, ממתין למחשב",
-  printing: "🖨️ מדפיס…",
-  done: "✅ הודפס",
-  error: "❌ נכשל",
+async function check() {
+  if (!link) return;
+  setReady("checking", "⋯", "בודק את המדפסת…", "פונה למחשב של המדפסת");
+  try {
+    await link.send({ t: "ping" });
+  } catch (e) {
+    if (e.status === 429) setReady("bad", "!", "שירות ההעברה עמוס כרגע", "נסו שוב בעוד דקה (לחצו כאן)");
+    else setReady("bad", "!", "אין חיבור לאינטרנט", "בדקו את החיבור של המכשיר הזה ולחצו לבדיקה חוזרת");
+    return;
+  }
+  clearTimeout(pongTimer);
+  pongTimer = setTimeout(() => {
+    if (Date.now() - lastPong > PONG_TIMEOUT) {
+      health = null;
+      setReady("bad", "✕", "המחשב של המדפסת לא עונה",
+        "בדקו שהמחשב דלוק ומחובר לאינטרנט ושהסיסמה נכונה. לחצו לבדיקה חוזרת.");
+      $("printerHint").textContent = "אפשר בכל זאת לשלוח. ההדפסה תצא כשהמחשב יחזור (תוך כמה שעות).";
+    }
+  }, PONG_TIMEOUT);
+}
+
+function onPong(msg) {
+  if ((msg.ts || 0) < Date.now() - 5 * 60 * 1000) return;      // old answer from history
+  lastPong = Date.now();
+  clearTimeout(pongTimer);
+  health = msg.health || { ready: true, problems: [], warnings: [], name: "" };
+  wordOnPc = msg.word !== false;
+  const where = `${health.name || "מדפסת"}${msg.host ? ` · מחשב ${msg.host}` : ""}`;
+  if (health.ready) {
+    const warn = health.warnings?.length ? ` · ${health.warnings.join(", ")}` : "";
+    setReady("ok", "✓", "המדפסת מוכנה להדפסה", where + warn);
+  } else {
+    setReady("warn", "!", "המחשב מחובר, אבל יש בעיה במדפסת", `${health.problems.join(" · ")} (${where})`);
+  }
+  fillPrinters(msg.printers || [], msg.printer || "", msg.default || "");
+  updateFileHint();
+}
+
+// ================================================================ jobs + result panels
+const STATE = {
+  sent:     { icon: "⏳", big: "נשלח, ממתין לאישור מהמחשב…", list: "⏳ נשלח" },
+  printing: { icon: "🖨️", big: "המחשב קיבל, מדפיס…",            list: "🖨️ מדפיס" },
+  done:     { icon: "✅", big: "הודפס בהצלחה!",                   list: "✅ הודפס" },
+  error:    { icon: "❌", big: "ההדפסה לא הצליחה",                 list: "❌ נכשל" },
 };
+const resultFor = {};      // job id -> result panel element
+
+function showResult(panel, state, small) {
+  panel.hidden = false;
+  panel.className = "result " + state;
+  panel.querySelector(".icon").textContent = STATE[state].icon;
+  panel.querySelector(".big").textContent = STATE[state].big;
+  panel.querySelector(".small").textContent = small || "";
+}
 
 function jobs() { return store.get(JOBS_KEY, []); }
 
 function saveJob(job) {
-  const list = jobs().filter((j) => j.id !== job.id);
-  list.unshift(job);
-  store.set(JOBS_KEY, list.slice(0, 15));
+  store.set(JOBS_KEY, [job, ...jobs().filter((j) => j.id !== job.id)].slice(0, 15));
   renderJobs();
 }
 
-function updateJob(id, patch) {
+function onStatus(msg) {
   const list = jobs();
-  const job = list.find((j) => j.id === id);
+  const job = list.find((j) => j.id === msg.id);
   if (!job) return;
-  Object.assign(job, patch);
+  job.state = msg.state;
+  job.note = msg.state === "error" ? msg.error : msg.detail;
   store.set(JOBS_KEY, list);
   renderJobs();
+  const panel = resultFor[msg.id];
+  if (panel) {
+    const small = msg.state === "done"
+      ? `המחשב אישר: ${msg.detail || "ההדפסה הסתיימה תקין"}`
+      : (msg.state === "error" ? msg.error : msg.detail);
+    showResult(panel, msg.state, small);
+  }
 }
 
 function renderJobs() {
@@ -63,25 +121,19 @@ function renderJobs() {
     label.textContent = `${j.label} · ${time}`;
     const st = document.createElement("span");
     st.className = "state " + j.state;
-    st.textContent = STATE_TEXT[j.state] + (j.error ? `: ${j.error}` : "");
+    st.textContent = STATE[j.state].list;
+    if (j.note) st.title = j.note;
     li.append(label, st);
     return li;
   }));
 }
 
-// ---------------------------------------------------------------- printer computer
 function onReply(msg) {
-  if (msg.t === "status" && msg.id) {
-    updateJob(msg.id, { state: msg.state, error: msg.error || "" });
-  } else if (msg.t === "pong") {
-    if ((msg.ts || 0) < Date.now() - 5 * 60 * 1000) return;   // old reply from history
-    lastPong = Date.now();
-    clearTimeout(pongTimer);
-    setStatus("ok", `המחשב מחובר${msg.host ? ` (${msg.host})` : ""}`);
-    fillPrinters(msg.printers || [], msg.printer || "", msg.default || "");
-  }
+  if (msg.t === "pong") onPong(msg);
+  else if (msg.t === "status" && msg.id) onStatus(msg);
 }
 
+// ================================================================ printers
 function fillPrinters(printers, current, def) {
   const sel = $("printer");
   sel.replaceChildren();
@@ -93,27 +145,17 @@ function fillPrinters(printers, current, def) {
   $("printerHint").textContent = "";
 }
 
-async function ping() {
-  if (!link) return;
-  setStatus("wait", "בודק חיבור למחשב…");
+$("printer").addEventListener("change", async () => {
   try {
-    await link.send({ t: "ping" });
-  } catch {
-    setStatus("bad", "אין חיבור לאינטרנט");
-    return;
+    await link.send({ t: "settings", printer: $("printer").value });
+    $("printerHint").textContent = "✓ נשמר. בודק את המדפסת שנבחרה…";
+    setReady("checking", "⋯", "בודק את המדפסת…", $("printer").value || "מדפסת ברירת המחדל");
+  } catch (e) {
+    $("printerHint").textContent = e.message;
   }
-  clearTimeout(pongTimer);
-  pongTimer = setTimeout(() => {
-    if (Date.now() - lastPong > 12000) {
-      setStatus("bad", "המחשב לא עונה");
-      $("printerHint").textContent =
-        "המחשב של המדפסת לא ענה. בדקו שהוא דלוק ומחובר לאינטרנט, ושהסיסמה נכונה. " +
-        "אפשר בכל זאת לשלוח, וזה יודפס כשהמחשב יחזור (עד כמה שעות).";
-    }
-  }, 12000);
-}
+});
 
-// ---------------------------------------------------------------- login
+// ================================================================ session
 async function startSession(newLink) {
   link = newLink;
   $("login").hidden = true;
@@ -121,7 +163,7 @@ async function startSession(newLink) {
   renderJobs();
   events?.close();
   events = link.listen(onReply);
-  ping();
+  check();
   assetsReady = assetsReady || loadAssets();
   await assetsReady;
   redraw();
@@ -148,128 +190,143 @@ $("logout").addEventListener("click", () => {
   link = null;
   $("app").hidden = true;
   $("login").hidden = false;
-  $("statusPill").hidden = true;
 });
 
-// ---------------------------------------------------------------- tabs
+$("ready").addEventListener("click", check);
+setInterval(() => { if (link && document.visibilityState === "visible") check(); }, RECHECK_EVERY);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && link && Date.now() - lastPong > 60000) check();
+});
+
+// ================================================================ tabs
 document.querySelectorAll("[role=tab]").forEach((b) => b.addEventListener("click", () => {
   document.querySelectorAll("[role=tab]").forEach((x) => x.setAttribute("aria-selected", x === b));
   $("tab-name").hidden = b.dataset.tab !== "name";
   $("tab-file").hidden = b.dataset.tab !== "file";
 }));
 
-// ---------------------------------------------------------------- name in a style
-for (const s of STYLES) {
+// ================================================================ wording + name
+function choosePreset(p, button) {
+  document.querySelectorAll("#presets button").forEach((x) => x.setAttribute("aria-pressed", x === button));
+  $("title").value = p.title;
+  $("footer").value = p.footer;
+  if (p.key === "custom") $("title").focus();
+  redraw();
+}
+PRESETS.forEach((p, i) => {
   const b = document.createElement("button");
   b.type = "button";
-  b.textContent = s.title;
-  b.setAttribute("aria-pressed", s === style);
-  b.addEventListener("click", () => {
-    style = s;
-    document.querySelectorAll("#styles button").forEach((x) => x.setAttribute("aria-pressed", x === b));
-    redraw();
-  });
-  $("styles").append(b);
+  b.textContent = p.label;
+  b.setAttribute("aria-pressed", "false");
+  b.addEventListener("click", () => choosePreset(p, b));
+  $("presets").append(b);
+  if (i === 0) choosePreset(p, b);
+});
+
+function currentDoc() {
+  return {
+    title: cleanLines($("title").value, MAX_TITLE_LINES),
+    names: cleanLines($("names").value, MAX_NAME_LINES),
+    footer: $("footer").value.replace(/\s+/g, " ").trim(),
+  };
 }
 
-function currentNames() { return cleanLines($("names").value); }
+function autoGrow(el) {
+  el.style.height = "auto";
+  el.style.height = el.scrollHeight + 2 + "px";
+}
 
-let raf = 0;
 function redraw() {
   cancelAnimationFrame(raf);
   raf = requestAnimationFrame(async () => {
+    if (!assetsReady) return;
     await assetsReady;
-    drawPage($("preview"), style, currentNames(), true);
-    const n = $("names").value.split(/\r?\n/).filter((l) => l.trim()).length;
-    $("namesHint").textContent = n > MAX_LINES ? `רק ${MAX_LINES} השורות הראשונות יודפסו.` : `עד ${MAX_LINES} שורות.`;
+    drawPage($("preview"), currentDoc(), true);
   });
 }
-$("names").addEventListener("input", redraw);
-
-function newId() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+for (const id of ["title", "names", "footer"]) {
+  $(id).addEventListener("input", () => {
+    if (id !== "footer") autoGrow($(id));
+    if (id === "title") {   // typing your own wording = "custom"
+      const match = PRESETS.find((p) => p.title === $("title").value.trim());
+      document.querySelectorAll("#presets button").forEach((b, i) =>
+        b.setAttribute("aria-pressed", PRESETS[i] === (match || PRESETS[PRESETS.length - 1])));
+    }
+    redraw();
+  });
 }
 
-function showMsg(el, kind, text) {
-  el.className = "msg " + kind;
-  el.textContent = text;
+const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
+function confirmIfNotReady() {
+  if (health?.ready) return true;
+  const why = health ? health.problems.join(", ") : "המחשב של המדפסת לא ענה";
+  return confirm(`שימו לב: ${why}.\nלשלוח בכל זאת? (ההדפסה תצא כשהבעיה תסודר)`);
+}
+
+async function sendJob(meta, bytes, button, msgEl, panel) {
+  msgEl.textContent = "";
+  if (!confirmIfNotReady()) return;
+  button.disabled = true;
+  try {
+    const id = newId();
+    await link.sendPrint({ id, ...meta }, bytes);
+    saveJob({ id, label: meta.label, time: Date.now(), state: "sent" });
+    resultFor[id] = panel;
+    showResult(panel, "sent", "הדף הוכן ונשלח מוצפן למחשב של המדפסת");
+  } catch (e) {
+    msgEl.textContent = e.message || "השליחה נכשלה";
+  } finally {
+    button.disabled = false;
+  }
 }
 
 $("sendName").addEventListener("click", async () => {
-  const names = currentNames();
-  if (!names.length) {
-    showMsg($("nameMsg"), "bad", "צריך לכתוב שם.");
+  const doc = currentDoc();
+  if (!doc.names.length) {
+    $("nameMsg").textContent = "צריך לכתוב שם.";
     $("names").focus();
     return;
   }
-  const btn = $("sendName");
-  btn.disabled = true;
-  showMsg($("nameMsg"), "", "מכין ושולח…");
-  try {
-    await assetsReady;
-    const canvas = document.createElement("canvas");
-    canvas.width = PRINT_W;
-    canvas.height = PRINT_H;
-    drawPage(canvas, style, names, false);
-    const pdf = await canvasToPdf(canvas);
-    const id = newId();
-    const label = `${style.title} – ${names.join(", ")}`;
-    await link.sendPrint({ id, name: `${style.title} - ${names[0]}.pdf`, label }, pdf);
-    saveJob({ id, label, time: Date.now(), state: "sent" });
-    showMsg($("nameMsg"), "ok", "✓ נשלח! הסטטוס מתעדכן למטה.");
-  } catch (e) {
-    showMsg($("nameMsg"), "bad", e.message || "השליחה נכשלה");
-  } finally {
-    btn.disabled = false;
+  if (!doc.title.length) {
+    $("nameMsg").textContent = "צריך לבחור או לכתוב נוסח.";
+    $("title").focus();
+    return;
   }
+  await assetsReady;
+  const canvas = document.createElement("canvas");
+  canvas.width = PRINT_W;
+  canvas.height = PRINT_H;
+  drawPage(canvas, doc, false);
+  const pdf = await canvasToPdf(canvas);
+  const label = `${doc.title.join(" ")} – ${doc.names.join(", ")}`;
+  await sendJob({ name: `${doc.title[0]} - ${doc.names[0]}.pdf`, label }, pdf, $("sendName"), $("nameMsg"), $("nameResult"));
 });
 
-// ---------------------------------------------------------------- file
+// ================================================================ file
 let chosen = null;
+function updateFileHint() {
+  const isWord = chosen && !/\.pdf$/i.test(chosen.name);
+  $("fileHint").textContent = isWord && !wordOnPc
+    ? "⚠️ במחשב של המדפסת לא מותקן Word, ולכן קבצי Word לא יודפסו. שלחו PDF."
+    : "עד 15MB. קבצי Word מודפסים אם במחשב של המדפסת מותקן Word.";
+}
 $("file").addEventListener("change", () => {
   chosen = $("file").files[0] || null;
   $("drop").classList.toggle("has", !!chosen);
   $("fileLabel").textContent = chosen ? `📄 ${chosen.name}` : "לחצו כאן לבחירת קובץ";
-  $("sendFile").disabled = !chosen;
-  showMsg($("fileMsg"), "", "");
-  if (chosen && chosen.size > MAX_FILE) {
-    showMsg($("fileMsg"), "bad", "הקובץ גדול מ-15MB.");
-    $("sendFile").disabled = true;
-  }
+  $("sendFile").disabled = !chosen || chosen.size > MAX_FILE;
+  $("fileMsg").textContent = chosen && chosen.size > MAX_FILE ? "הקובץ גדול מ-15MB." : "";
+  $("fileResult").hidden = true;
+  updateFileHint();
 });
-
 $("sendFile").addEventListener("click", async () => {
   if (!chosen) return;
-  const btn = $("sendFile");
-  btn.disabled = true;
-  showMsg($("fileMsg"), "", "מצפין ושולח…");
-  try {
-    const id = newId();
-    await link.sendPrint({ id, name: chosen.name, label: chosen.name }, new Uint8Array(await chosen.arrayBuffer()));
-    saveJob({ id, label: chosen.name, time: Date.now(), state: "sent" });
-    showMsg($("fileMsg"), "ok", "✓ נשלח! הסטטוס מתעדכן למטה.");
-  } catch (e) {
-    showMsg($("fileMsg"), "bad", e.message || "השליחה נכשלה");
-  } finally {
-    btn.disabled = false;
-  }
+  await sendJob({ name: chosen.name, label: chosen.name }, new Uint8Array(await chosen.arrayBuffer()),
+    $("sendFile"), $("fileMsg"), $("fileResult"));
 });
 
-// ---------------------------------------------------------------- printer choice
-$("printer").addEventListener("change", async () => {
-  try {
-    await link.send({ t: "settings", printer: $("printer").value });
-    $("printerHint").textContent = "✓ נשמר";
-  } catch (e) {
-    $("printerHint").textContent = e.message;
-  }
-});
-$("refresh").addEventListener("click", ping);
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && link && Date.now() - lastPong > 60000) ping();
-});
-
-// ---------------------------------------------------------------- start
+// ================================================================ start
 const saved = store.get(SAVED_KEY, null);
 if (saved?.topic && saved?.key) {
   fromSaved(saved).then(startSession).catch(() => store.del(SAVED_KEY));

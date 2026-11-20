@@ -77,7 +77,23 @@ jobs:
           python tools\send_test.py --password $pw ping
           if ($LASTEXITCODE -ne 0) { Get-Content "$app\remote_printer.log"; exit 1 }
 
-          # print job end to end, in dry-run mode (the build machine has no real printer)
+          # REAL silent print: a test printer whose output goes to a file (no dialogs)
+          New-Item -ItemType Directory -Force C:\ci | Out-Null
+          Add-PrinterPort -Name "C:\ci\printed.pdf"
+          Add-Printer -Name "CI Test Printer" -DriverName "Microsoft Print To PDF" -PortName "C:\ci\printed.pdf"
+          Stop-Process -Name RemotePrinter -Force
+          Add-Content "$app\config.ini" "printer_name = CI Test Printer"
+          Start-Process "$app\RemotePrinter.exe" -WorkingDirectory $app
+          Start-Sleep 6
+          python tools\send_test.py --password $pw ping
+          python tools\send_test.py --password $pw print tools\test_page.pdf
+          if ($LASTEXITCODE -ne 0) { Get-Content "$app\remote_printer.log"; throw "real print failed" }
+          Start-Sleep 2
+          $out = Get-Item C:\ci\printed.pdf -ErrorAction SilentlyContinue
+          if (-not $out -or $out.Length -lt 1000) { Get-Content "$app\remote_printer.log"; throw "printer output missing" }
+          Write-Host "Printed output: $($out.Length) bytes"
+
+          # error path, in dry-run mode
           Stop-Process -Name RemotePrinter -Force
           Add-Content "$app\config.ini" "dry_run = yes"
           Start-Process "$app\RemotePrinter.exe" -WorkingDirectory $app

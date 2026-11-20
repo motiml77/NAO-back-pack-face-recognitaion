@@ -45,7 +45,12 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.0"
+try:   # top-level import so the packager bundles it
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except ImportError:   # pragma: no cover
+    AESGCM = None
+
+VERSION = "2.1"
 FROZEN = getattr(sys, "frozen", False)
 BASE_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.ini"
@@ -174,6 +179,128 @@ def list_printers():
     except Exception:
         pass
     return names, default
+
+
+# --------------------------------------------------------------------------- printer health
+
+VIRTUAL_PRINTERS = ("microsoft print to pdf", "microsoft xps", "onenote", "fax", "send to", "adobe pdf", "pdf24", "cutepdf")
+
+PRINTER_PROBLEMS = [          # Windows PRINTER_STATUS_* flags
+    (0x00000001, "המדפסת מושהית"),
+    (0x00000002, "יש שגיאה במדפסת"),
+    (0x00000008, "נייר תקוע במדפסת"),
+    (0x00000010, "נגמר הנייר"),
+    (0x00000020, "המדפסת מחכה להזנת נייר ידנית"),
+    (0x00000080, "המדפסת לא מחוברת (Offline)"),
+    (0x00001000, "המדפסת לא זמינה"),
+    (0x00040000, "נגמר הדיו / הטונר"),
+    (0x00100000, "המדפסת צריכה טיפול"),
+    (0x00400000, "מכסה המדפסת פתוח"),
+]
+PRINTER_WARNINGS = [(0x00020000, "הדיו / הטונר עומד להיגמר")]
+
+JOB_DONE = 0x0080 | 0x1000 | 0x0100                    # PRINTED | COMPLETE | DELETED
+JOB_PROBLEMS = [(0x0040, "נגמר הנייר"), (0x0020, "המדפסת לא מחוברת"), (0x0400, "המדפסת צריכה טיפול"),
+                (0x0002, "שגיאה בהדפסה"), (0x0200, "ההדפסה נחסמה"), (0x0001, "ההדפסה מושהית")]
+
+
+def word_installed() -> bool:
+    if not IS_WINDOWS:
+        return False
+    try:
+        import winreg
+        winreg.CloseKey(winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"Word.Application\CLSID"))
+        return True
+    except OSError:
+        return False
+
+
+def printer_health(configured: str) -> dict:
+    """Is the printer ready? Returns {name, ready, problems, warnings}."""
+    printers, default = list_printers()
+    name = configured or default
+    info = {"name": name, "ready": False, "problems": [], "warnings": []}
+    if not printers:
+        info["problems"].append("לא נמצאה אף מדפסת במחשב")
+        return info
+    if not name:
+        info["problems"].append("לא הוגדרה מדפסת ברירת מחדל - בחרו מדפסת באתר")
+        return info
+    if name not in printers:
+        info["problems"].append(f"המדפסת \"{name}\" לא נמצאה במחשב")
+        return info
+    if any(v in name.lower() for v in VIRTUAL_PRINTERS):
+        info["problems"].append("זו מדפסת וירטואלית ששומרת לקובץ - בחרו את המדפסת האמיתית")
+    if IS_WINDOWS:
+        try:
+            import win32print
+            h = win32print.OpenPrinter(name)
+            try:
+                d = win32print.GetPrinter(h, 2)
+            finally:
+                win32print.ClosePrinter(h)
+            status, attrs = d.get("Status", 0), d.get("Attributes", 0)
+            info["problems"] += [t for f, t in PRINTER_PROBLEMS if status & f]
+            info["warnings"] += [t for f, t in PRINTER_WARNINGS if status & f]
+            if attrs & 0x400:     # PRINTER_ATTRIBUTE_WORK_OFFLINE
+                info["problems"].append("המדפסת מוגדרת במצב לא מקוון")
+            if d.get("cJobs"):
+                info["warnings"].append(f"יש {d['cJobs']} עבודות בתור של המדפסת")
+        except Exception as e:
+            info["problems"].append(f"לא ניתן לבדוק את המדפסת ({e})")
+    else:
+        try:
+            out = subprocess.run(["lpstat", "-p", name], capture_output=True, text=True, timeout=10).stdout
+            if "disabled" in out:
+                info["problems"].append("המדפסת מושבתת")
+        except Exception:
+            pass
+    info["ready"] = not info["problems"]
+    return info
+
+
+def spool_jobs(name: str) -> dict:
+    """Windows print queue: {job_id: status}. Empty dict when not available."""
+    if not (IS_WINDOWS and name):
+        return {}
+    try:
+        import win32print
+        h = win32print.OpenPrinter(name)
+        try:
+            return {j["JobId"]: j.get("Status", 0) for j in win32print.EnumJobs(h, 0, 999, 1)}
+        finally:
+            win32print.ClosePrinter(h)
+    except Exception:
+        return {}
+
+
+def wait_for_printer(name: str, before: dict, timeout=300):
+    """Follow our job in the Windows queue until the printer has finished it.
+    Returns (ok, message)."""
+    if not (IS_WINDOWS and name):
+        return True, "נשלח למדפסת"
+    ours, t0 = set(), time.time()
+    while time.time() - t0 < 15 and not ours:       # wait for the job to show up in the queue
+        ours = set(spool_jobs(name)) - set(before)
+        if not ours:
+            time.sleep(0.5)
+    if not ours:     # very fast printers / drivers that hide finished jobs
+        return True, "המדפסת קיבלה את הדף"
+    problem_since = None
+    while time.time() - t0 < timeout:
+        jobs = spool_jobs(name)
+        left = {j: st for j, st in jobs.items() if j in ours and not st & JOB_DONE}
+        if not left:
+            return True, "המדפסת סיימה להדפיס"
+        problems = [t for st in left.values() for f, t in JOB_PROBLEMS if st & f]
+        if problems:
+            problem_since = problem_since or time.time()
+            if time.time() - problem_since > 25:
+                return False, problems[0] + " (הדף ממתין בתור ויודפס כשהבעיה תסודר)"
+        else:
+            problem_since = None
+        time.sleep(1)
+    return False, "ההדפסה עדיין ממתינה בתור של המדפסת"
 
 
 # --------------------------------------------------------------------------- printing
@@ -398,10 +525,16 @@ class PrintQueue:
     def _worker(self):
         while True:
             path, source, notify = self.q.get()
-            ok, err = True, None
+            ok, err = True, "נשלח למדפסת"
             try:
+                target = self.printer.printer_name or list_printers()[1]
+                before = {} if self.printer.dry_run else spool_jobs(target)
                 self.printer.print_file(path)
-                log.info("Printed %s (from %s)", path.name, source)
+                if not self.printer.dry_run:
+                    ok, err = wait_for_printer(target, before)
+                else:
+                    err = "מצב בדיקה - לא הודפס באמת"
+                log.info("Printed %s (from %s): %s", path.name, source, err)
             except Exception as e:
                 ok, err = False, str(e)
                 log.exception("Printing %s failed", path.name)
@@ -429,7 +562,8 @@ def derive_channel(password: str):
 
 class Channel:
     def __init__(self, topic: str, key_hex: str):
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        if AESGCM is None:
+            raise SystemExit("The 'cryptography' package is missing")
         self.topic = topic
         self.aes = AESGCM(bytes.fromhex(key_hex))
 
@@ -572,9 +706,14 @@ class Agent:
 
     def pong(self):
         printers, default = list_printers()
+        health = printer_health(self.printer.printer_name)
+        if IS_WINDOWS and not self.printer.sumatra:
+            health["problems"].append("רכיב ההדפסה חסר - הריצו שוב את ההתקנה")
+            health["ready"] = False
         self.ch.reply({"t": "pong", "printers": printers, "default": default,
                        "printer": self.printer.printer_name, "host": socket.gethostname(),
-                       "version": VERSION})
+                       "version": VERSION, "health": health, "word": word_installed(),
+                       "queue": self.pq.pending()})
 
     def apply_settings(self, msg):
         name = (msg.get("printer") or "").strip()
@@ -596,8 +735,8 @@ class Agent:
         self._save_state()
         label = msg.get("label") or msg.get("name") or job_id
 
-        def status(state, error=""):
-            self.ch.reply({"t": "status", "id": job_id, "state": state, "error": error})
+        def status(state, error="", detail=""):
+            self.ch.reply({"t": "status", "id": job_id, "state": state, "error": error, "detail": detail})
 
         try:
             name = msg.get("name") or "document.pdf"
@@ -618,10 +757,13 @@ class Agent:
             return
 
         log.info("Job received: %s", label)
-        status("printing")
+        status("printing", detail="המחשב קיבל את הדף ושלח אותו למדפסת")
 
-        def notify(ok, err):
-            status("done" if ok else "error", "" if ok else (err or "")[:200])
+        def notify(ok, detail):
+            if ok:
+                status("done", detail=detail)
+            else:
+                status("error", error=(detail or "")[:200])
 
         self.pq.submit(path, f"site/{label}", notify)
 
@@ -656,6 +798,8 @@ def selftest() -> int:
 
     check("crypto", crypto_roundtrip)
     check("printer list", lambda: list_printers())
+    check("printer health", lambda: printer_health(""))
+    check("Word installed", word_installed)
     if IS_WINDOWS:
         check("pywin32", lambda: __import__("win32com.client").__name__)
         check("SumatraPDF", lambda: Printer._find_sumatra("") or (_ for _ in ()).throw(RuntimeError("missing")))

@@ -10,67 +10,90 @@
 @font-face { font-family: Stam; src: url(fonts/StamAshkenazCLM.ttf); font-display: block; }
 :root {
   --bg: #f4f2ee; --card: #fff; --ink: #1d1d1f; --muted: #6b6b70; --line: #e2dfd8;
-  --accent: #2f4a7a; --accent-ink: #fff; --ok: #2e7d32; --warn: #b26a00; --bad: #c62828;
-  --radius: 14px;
+  --accent: #2f4a7a; --ok: #1f8a3b; --ok-bg: #e7f6ea; --warn: #b26a00; --warn-bg: #fff4e0;
+  --bad: #c62828; --bad-bg: #fdecec; --radius: 14px;
 }
 * { box-sizing: border-box; }
-body {
-  margin: 0; background: var(--bg); color: var(--ink);
-  font: 16px/1.5 system-ui, "Segoe UI", Arial, sans-serif;
-}
+body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.5 system-ui, "Segoe UI", Arial, sans-serif; }
 .wrap { max-width: 860px; margin: 0 auto; padding: 16px; }
-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 4px 0 16px; flex-wrap: wrap; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 4px 0 14px; }
 h1 { font-size: 22px; margin: 0; }
-.pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 99px;
-        background: var(--card); border: 1px solid var(--line); font-size: 14px; color: var(--muted); }
-.dot { width: 9px; height: 9px; border-radius: 50%; background: #bbb; }
-.dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); } .dot.wait { background: var(--warn); }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; margin-bottom: 16px; }
 .card h2 { font-size: 17px; margin: 0 0 12px; }
-label.title { display: block; font-weight: 600; margin: 14px 0 6px; }
+label.title { display: block; font-weight: 600; margin: 16px 0 6px; }
 input[type=password], input[type=text], textarea, select {
   width: 100%; font: inherit; padding: 11px 12px; border: 1px solid var(--line); border-radius: 10px; background: #fff; color: var(--ink);
 }
-textarea { resize: vertical; min-height: 92px; font-size: 18px; }
+textarea { resize: vertical; }
+#title, #footer { font-size: 18px; }
+#names { font-size: 24px; font-weight: 600; min-height: 60px; }
 textarea:focus, input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 button { font: inherit; cursor: pointer; border-radius: 10px; border: 1px solid var(--line); background: #fff; padding: 10px 16px; color: var(--ink); }
-button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; font-size: 18px; padding: 14px 18px; width: 100%; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 700; font-size: 19px; padding: 15px 18px; width: 100%; }
 button:disabled { opacity: .55; cursor: default; }
+
+/* the big printer-ready button */
+.ready { width: 100%; display: flex; align-items: center; gap: 14px; padding: 16px 18px; border-radius: 16px;
+         border: 2px solid var(--line); background: #fff; text-align: right; margin-bottom: 16px; }
+.ready .icon { width: 54px; height: 54px; flex: 0 0 54px; border-radius: 50%; display: grid; place-items: center;
+               font-size: 30px; color: #fff; background: #9e9e9e; }
+.ready .big { font-size: 21px; font-weight: 800; display: block; }
+.ready .small { font-size: 14px; color: var(--muted); display: block; }
+.ready.ok { background: var(--ok-bg); border-color: var(--ok); }
+.ready.ok .icon { background: var(--ok); }
+.ready.ok .big { color: var(--ok); }
+.ready.warn { background: var(--warn-bg); border-color: var(--warn); }
+.ready.warn .icon { background: var(--warn); }
+.ready.warn .big { color: var(--warn); }
+.ready.bad { background: var(--bad-bg); border-color: var(--bad); }
+.ready.bad .icon { background: var(--bad); }
+.ready.bad .big { color: var(--bad); }
+.ready.checking .icon { animation: pulse 1s infinite alternate; }
+@keyframes pulse { from { opacity: .45 } to { opacity: 1 } }
+
 .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
 .tabs button { flex: 1; font-weight: 600; }
 .tabs button[aria-selected=true] { background: var(--ink); color: #fff; border-color: var(--ink); }
-.styles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-.styles button { font-family: Stam, serif; font-size: 22px; padding: 12px 6px; }
-.styles button[aria-pressed=true] { border: 2px solid var(--accent); background: #eef2f9; }
+.presets { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.presets button { font-family: Stam, serif; font-size: 21px; padding: 11px 4px; }
+.presets button[aria-pressed=true] { border: 2px solid var(--accent); background: #eef2f9; }
 .hint { color: var(--muted); font-size: 14px; margin: 6px 0 0; }
-.preview { margin-top: 16px; }
 .preview canvas { width: 100%; height: auto; display: block; border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,.18); background: #fff; }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .row > * { flex: 1; }
-.msg { margin-top: 10px; font-size: 15px; min-height: 1.5em; }
-.msg.ok { color: var(--ok); } .msg.bad { color: var(--bad); }
+
+/* result after sending */
+.result { margin-top: 14px; border-radius: 14px; padding: 16px; display: flex; gap: 14px; align-items: center; border: 2px solid var(--line); }
+.result .icon { font-size: 34px; line-height: 1; }
+.result .big { font-size: 20px; font-weight: 800; display: block; }
+.result .small { font-size: 14px; color: var(--muted); display: block; }
+.result.sent, .result.printing { background: var(--warn-bg); border-color: var(--warn); }
+.result.done { background: var(--ok-bg); border-color: var(--ok); }
+.result.done .big { color: var(--ok); }
+.result.error { background: var(--bad-bg); border-color: var(--bad); }
+.result.error .big { color: var(--bad); }
+
 ul.jobs { list-style: none; margin: 0; padding: 0; }
 ul.jobs li { display: flex; justify-content: space-between; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 15px; }
 ul.jobs li:last-child { border-bottom: 0; }
 .state { white-space: nowrap; }
 .state.done { color: var(--ok); } .state.error { color: var(--bad); } .state.sent, .state.printing { color: var(--warn); }
-.drop { border: 2px dashed var(--line); border-radius: 12px; padding: 22px; text-align: center; color: var(--muted); }
+.drop { display: block; border: 2px dashed var(--line); border-radius: 12px; padding: 22px; text-align: center; color: var(--muted); cursor: pointer; }
 .drop.has { border-color: var(--accent); color: var(--ink); }
 footer { display: flex; justify-content: space-between; align-items: center; gap: 10px; color: var(--muted); font-size: 14px; flex-wrap: wrap; }
 .link { background: none; border: 0; color: var(--accent); padding: 4px; text-decoration: underline; }
+.msg { margin-top: 10px; font-size: 15px; color: var(--bad); min-height: 0; }
 [hidden] { display: none !important; }
-@media (max-width: 520px) {
-  .styles { grid-template-columns: 1fr; }
+@media (max-width: 560px) {
+  .presets { grid-template-columns: 1fr 1fr; }
   h1 { font-size: 19px; }
+  .ready .big { font-size: 18px; }
 }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <header>
-    <h1>🖨️ הדפסה מרחוק</h1>
-    <span class="pill" id="statusPill" hidden><span class="dot" id="statusDot"></span><span id="statusText">בודק חיבור…</span></span>
-  </header>
+  <header><h1>🖨️ הדפסה מרחוק</h1></header>
 
   <!-- login -->
   <section class="card" id="login">
@@ -90,27 +113,39 @@ footer { display: flex; justify-content: space-between; align-items: center; gap
   </section>
 
   <main id="app" hidden>
+    <!-- live link to the printer computer -->
+    <button class="ready checking" id="ready" type="button" aria-live="polite">
+      <span class="icon" id="readyIcon">⋯</span>
+      <span><span class="big" id="readyBig">בודק את המדפסת…</span><span class="small" id="readySmall">פונה למחשב של המדפסת</span></span>
+    </button>
+
     <div class="tabs" role="tablist">
       <button role="tab" aria-selected="true" data-tab="name">✍️ הדפסת שם</button>
       <button role="tab" aria-selected="false" data-tab="file">📄 שליחת קובץ</button>
     </div>
 
-    <!-- name in a fixed style -->
+    <!-- wording + name -->
     <section class="card" id="tab-name">
-      <h2>בחירת נוסח</h2>
-      <div class="styles" id="styles"></div>
+      <h2>הנוסח</h2>
+      <div class="presets" id="presets"></div>
+      <label class="title" for="title">טקסט הנוסח (אפשר לשנות או לכתוב נוסח משלכם)</label>
+      <textarea id="title" rows="2" maxlength="200"></textarea>
 
-      <label class="title" for="names">שם (אפשר כמה שמות, כל שם בשורה נפרדת)</label>
-      <textarea id="names" placeholder="שרה בת רחל" maxlength="600"></textarea>
-      <p class="hint" id="namesHint">עד 8 שורות.</p>
+      <label class="title" for="names">השם (יופיע באותיות גדולות)</label>
+      <textarea id="names" rows="1" maxlength="300" placeholder="שרה בת רחל"></textarea>
+      <p class="hint">אפשר כמה שמות, כל שם בשורה נפרדת.</p>
 
-      <div class="preview">
-        <label class="title">תצוגה מקדימה</label>
-        <canvas id="preview" width="1188" height="840" aria-label="תצוגה מקדימה של הדף"></canvas>
-      </div>
+      <label class="title" for="footer">שורה תחתונה (לא חובה)</label>
+      <input type="text" id="footer" maxlength="80">
+
+      <label class="title">דוגמה לפני הדפסה</label>
+      <div class="preview"><canvas id="preview" width="1188" height="840" aria-label="דוגמה של הדף"></canvas></div>
 
       <div style="margin-top:16px"><button class="primary" id="sendName">🖨️ שליחה להדפסה</button></div>
-      <div class="msg" id="nameMsg" role="status"></div>
+      <div class="msg" id="nameMsg" role="alert"></div>
+      <div class="result" id="nameResult" hidden role="status">
+        <span class="icon"></span><span><span class="big"></span><span class="small"></span></span>
+      </div>
     </section>
 
     <!-- any file -->
@@ -120,9 +155,12 @@ footer { display: flex; justify-content: space-between; align-items: center; gap
         <input type="file" id="file" accept=".pdf,.doc,.docx,.rtf,.odt" hidden>
         <span id="fileLabel">לחצו כאן לבחירת קובץ</span>
       </label>
-      <p class="hint">עד 15MB. קבצי Word מודפסים רק אם במחשב של המדפסת מותקן Word.</p>
+      <p class="hint" id="fileHint">עד 15MB.</p>
       <div style="margin-top:14px"><button class="primary" id="sendFile" disabled>🖨️ שליחה להדפסה</button></div>
-      <div class="msg" id="fileMsg" role="status"></div>
+      <div class="msg" id="fileMsg" role="alert"></div>
+      <div class="result" id="fileResult" hidden role="status">
+        <span class="icon"></span><span><span class="big"></span><span class="small"></span></span>
+      </div>
     </section>
 
     <section class="card">
@@ -132,11 +170,8 @@ footer { display: flex; justify-content: space-between; align-items: center; gap
     </section>
 
     <section class="card">
-      <h2>המדפסת</h2>
-      <div class="row">
-        <select id="printer" disabled><option>ממתין לחיבור למחשב…</option></select>
-        <button id="refresh" style="flex:0 0 auto">רענון</button>
-      </div>
+      <h2>לאיזו מדפסת להדפיס</h2>
+      <select id="printer" disabled><option>ממתין לחיבור למחשב…</option></select>
       <p class="hint" id="printerHint"></p>
     </section>
 

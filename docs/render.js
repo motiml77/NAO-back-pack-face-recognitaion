@@ -1,54 +1,75 @@
-// Draws the printed page: the scroll frame + fixed wording + the names.
+// Draws the printed page: the decorative frame + the wording + the name (in larger letters).
 // Used both for the live preview and for the PDF that is sent to the printer.
+//
+// To change the look, replace frame.svg (any image the size of an A4 landscape page
+// works, e.g. frame.png - then change FRAME_SRC) and adjust LAYOUT below.
 
 export const PAGE_W = 2970;   // A4 landscape, in 0.1 mm
 export const PAGE_H = 2100;
+const FRAME_SRC = "frame.svg";
+const ORNAMENT_SRC = "ornament.svg";
 
-export const STYLES = [
-  { key: "niftar",    title: "לעילוי נשמת",    footer: "ת.נ.צ.ב.ה" },
-  { key: "refua",     title: "לרפואה שלמה",    footer: "בתוך שאר חולי ישראל" },
-  { key: "hatzlacha", title: "להצלחה ופרנסה", footer: "" },
+// Fixed wordings. "custom" lets the user write their own.
+export const PRESETS = [
+  { key: "niftar",    label: "לעילוי נשמת",    title: "לעילוי נשמת",    footer: "ת.נ.צ.ב.ה" },
+  { key: "refua",     label: "לרפואה שלמה",    title: "לרפואה שלמה",    footer: "בתוך שאר חולי ישראל" },
+  { key: "hatzlacha", label: "להצלחה ופרנסה", title: "להצלחה ופרנסה", footer: "" },
+  { key: "custom",    label: "נוסח אישי",       title: "",               footer: "" },
 ];
 
-export const MAX_LINES = 8;
+const LAYOUT = {
+  textWidth: 2000,       // max width of any line
+  top: 330,              // top of the wording block
+  titleSize: 190,        // wording font size (shrinks to fit)
+  nameMax: 320,          // name font size (shrinks to fit) - larger than the wording
+  footerY: 1765,
+  footerSize: 105,
+  bottom: 1680,          // lowest point for names when there is a footer
+  bottomNoFooter: 1790,
+};
+
+export const MAX_TITLE_LINES = 3;
+export const MAX_NAME_LINES = 6;
 const FONT = "Stam";
 const INK = "#1b1b1b";
 
 let frame = null;
+let ornament = null;
+
+async function loadImage(src) {
+  const img = new Image();
+  img.src = src;
+  await img.decode();
+  return img;
+}
 
 export async function loadAssets() {
   await document.fonts.load(`100px ${FONT}`, "לעילוי נשמת");
-  frame = new Image();
-  frame.src = "frame.svg";
-  await frame.decode();
+  [frame, ornament] = await Promise.all([loadImage(FRAME_SRC), loadImage(ORNAMENT_SRC)]);
 }
 
-function fontPx(size) {
-  return `${size}px ${FONT}`;
-}
+const fontPx = (size) => `${size}px ${FONT}`;
 
-// Largest size <= max at which the text fits in maxWidth.
 function fitSize(ctx, text, max, maxWidth) {
   ctx.font = fontPx(max);
   const w = ctx.measureText(text).width;
   return w <= maxWidth ? max : Math.floor(max * maxWidth / w);
 }
 
-export function cleanLines(text) {
+export function cleanLines(text, max) {
   return (text || "")
     .split(/\r?\n/)
     .map((l) => l.replace(/\s+/g, " ").trim())
     .filter(Boolean)
-    .slice(0, MAX_LINES);
+    .slice(0, max);
 }
 
 /**
  * @param {HTMLCanvasElement} canvas  any size with a 2970:2100 ratio
- * @param {object} style              one of STYLES
- * @param {string[]} names            lines to print
- * @param {boolean} placeholder       show a grey hint when there are no names (preview only)
+ * @param {{title: string[], names: string[], footer: string}} doc
+ * @param {boolean} placeholder  show grey hints for empty fields (preview only)
  */
-export function drawPage(canvas, style, names, placeholder = false) {
+export function drawPage(canvas, doc, placeholder = false) {
   const ctx = canvas.getContext("2d");
   const s = canvas.width / PAGE_W;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -60,51 +81,62 @@ export function drawPage(canvas, style, names, placeholder = false) {
   ctx.textAlign = "center";
   ctx.textBaseline = "alphabetic";
   ctx.direction = "rtl";
-
+  const cx = PAGE_W / 2;
   const shadow = (on) => {
     ctx.shadowColor = on ? "rgba(0,0,0,0.28)" : "transparent";
     ctx.shadowBlur = on ? 8 : 0;
     ctx.shadowOffsetX = on ? 3 : 0;
     ctx.shadowOffsetY = on ? 4 : 0;
   };
+  const hint = (lines, fallback) => (lines.length || !placeholder) ? [lines, INK] : [[fallback], "#a8a8a8"];
 
-  // heading
-  shadow(true);
-  ctx.fillStyle = INK;
-  const titleSize = fitSize(ctx, style.title, 270, 1900);
-  ctx.font = fontPx(titleSize);
-  ctx.fillText(style.title, PAGE_W / 2, 610);
-
-  // names
-  const top = 830;
-  const bottom = style.footer ? 1640 : 1760;
-  let lines = names;
-  let color = INK;
-  if (!lines.length && placeholder) {
-    lines = ["השם יופיע כאן"];
-    color = "#a3a3a3";
-    shadow(false);
-  }
-  if (lines.length) {
-    const lineH = Math.min(250, (bottom - top) / lines.length);
-    let size = Math.floor(lineH / 1.3);
-    for (const l of lines) size = Math.min(size, fitSize(ctx, l, size, 2050));
+  // wording
+  const [title, titleInk] = hint(doc.title, "הנוסח יופיע כאן");
+  let y = LAYOUT.top;
+  if (title.length) {
+    let size = Math.min(LAYOUT.titleSize, Math.floor(LAYOUT.titleSize * 2.2 / (title.length + 1.2)));
+    for (const l of title) size = Math.min(size, fitSize(ctx, l, size, LAYOUT.textWidth));
     ctx.font = fontPx(size);
-    ctx.fillStyle = color;
-    const blockH = lineH * lines.length;
-    let y = top + (bottom - top - blockH) / 2 + lineH / 2 + size * 0.35;
-    for (const l of lines) {
-      ctx.fillText(l, PAGE_W / 2, y);
-      y += lineH;
+    ctx.fillStyle = titleInk;
+    shadow(titleInk === INK);
+    for (const l of title) {
+      y += size * 1.12;
+      ctx.fillText(l, cx, y);
+    }
+  }
+
+  // ornament under the wording
+  shadow(false);
+  const ornW = 840 * 0.95, ornH = 120 * 0.95;
+  const ornY = y + 55;
+  ctx.drawImage(ornament, cx - ornW / 2, ornY, ornW, ornH);
+
+  // names - the biggest text on the page
+  const footer = (doc.footer || "").trim();
+  const top = ornY + ornH + 40;
+  const bottom = footer ? LAYOUT.bottom : LAYOUT.bottomNoFooter;
+  const [names, nameInk] = hint(doc.names, "השם יופיע כאן");
+  if (names.length) {
+    const lineH = Math.min(LAYOUT.nameMax * 1.25, (bottom - top) / names.length);
+    let size = Math.floor(lineH / 1.25);
+    for (const l of names) size = Math.min(size, fitSize(ctx, l, size, LAYOUT.textWidth));
+    ctx.font = fontPx(size);
+    ctx.fillStyle = nameInk;
+    shadow(nameInk === INK);
+    const blockH = lineH * names.length;
+    let ny = top + (bottom - top - blockH) / 2 + lineH / 2 + size * 0.36;
+    for (const l of names) {
+      ctx.fillText(l, cx, ny);
+      ny += lineH;
     }
   }
 
   // closing line
-  if (style.footer) {
+  if (footer) {
     shadow(false);
     ctx.fillStyle = "#3a3a3a";
-    ctx.font = fontPx(105);
-    ctx.fillText(style.footer, PAGE_W / 2, 1765);
+    ctx.font = fontPx(fitSize(ctx, footer, LAYOUT.footerSize, LAYOUT.textWidth));
+    ctx.fillText(footer, cx, LAYOUT.footerY);
   }
   ctx.setTransform(1, 0, 0, 1, 0, 0);
 }
