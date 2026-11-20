@@ -63,6 +63,16 @@ jobs:
 
       - name: Test - automatic install, autostart, watchdog, live link, real printing
         run: |
+          # 0. throw-away test channel, active from the very first second: the installed program
+          #    inherits these variables, so this machine never answers on the real channel
+          $pw = "ci-" + [guid]::NewGuid().ToString("N").Substring(0, 12)
+          $lines = python tools\test_channel.py $pw
+          $topic = ($lines | Select-String "^topic = ").ToString().Split("= ")[-1]
+          $key = ($lines | Select-String "^key = ").ToString().Split("= ")[-1]
+          $env:RP_TOPIC = $topic
+          $env:RP_KEY = $key
+          $env:RP_VERIFY_KEY = ($lines | Select-String "^verify_key = ").ToString().Split("= ")[-1]
+
           # 1. install exactly like a user would get it: no parameters, no questions
           $p = Start-Process dist\RemotePrinter-Setup.exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/LOG=install.log" -Wait -PassThru
           if ($p.ExitCode -ne 0) { Get-Content install.log; exit 1 }
@@ -77,11 +87,7 @@ jobs:
           if (-not (Get-Process RemotePrinter -ErrorAction SilentlyContinue)) { Get-Content "$app\remote_printer.log"; throw "program not running after install" }
           Get-Content "$app\remote_printer.log"
 
-          # 2. switch this test machine to a throw-away channel (never the real one)
-          $pw = "ci-" + [guid]::NewGuid().ToString("N").Substring(0, 12)
-          $lines = python tools\test_channel.py $pw
-          $topic = ($lines | Select-String "^topic = ").ToString().Split("= ")[-1]
-          $key = ($lines | Select-String "^key = ").ToString().Split("= ")[-1]
+          # 2. keep the test channel in config.ini too (the watchdog task does not inherit variables)
           New-Item -ItemType Directory -Force C:\ci | Out-Null
           Add-PrinterPort -Name "C:\ci\printed.pdf"
           Add-Printer -Name "Pantum CI Test" -DriverName "Microsoft Print To PDF" -PortName "C:\ci\printed.pdf"

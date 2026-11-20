@@ -639,7 +639,8 @@ class VerifyKey:
     """The website's public signing key (docs/channel.json on the website), cached on disk."""
 
     def __init__(self, cfg, state_get, state_set):
-        self.override = cfg.get("general", "verify_key", fallback="").strip().lower()   # for tests
+        self.override = (cfg.get("general", "verify_key", fallback="").strip()
+                         or os.environ.get("RP_VERIFY_KEY", "").strip()).lower()   # for tests
         self.state_get, self.state_set = state_get, state_set
         self.hex = self.override or state_get("verify_key", "")
         self.fetched = 0.0
@@ -982,8 +983,9 @@ def main():
     agent = Agent(cfg, None, printer, pq)
     verify = VerifyKey(cfg, lambda k, d: agent.state.get(k, d), agent.state_put)
     verify.refresh()
-    g = cfg["general"]          # test installations may use their own channel
-    agent.ch = Channel(g.get("topic", "").strip() or CHANNEL_TOPIC, g.get("key", "").strip() or CHANNEL_KEY, verify)
+    g = cfg["general"]          # test installations (CI) use their own channel - never the real one
+    agent.ch = Channel(g.get("topic", "").strip() or os.environ.get("RP_TOPIC", "").strip() or CHANNEL_TOPIC,
+                       g.get("key", "").strip() or os.environ.get("RP_KEY", "").strip() or CHANNEL_KEY, verify)
     log.info("Remote Printer %s started.", VERSION)
     try:
         agent.run()
