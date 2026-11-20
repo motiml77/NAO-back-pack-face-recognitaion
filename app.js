@@ -75,6 +75,7 @@ function onPong(msg) {
 const STATE = {
   sent:     { icon: "⏳", big: "נשלח, ממתין לאישור מהמחשב…", list: "⏳ נשלח" },
   printing: { icon: "🖨️", big: "המחשב קיבל, מדפיס…",            list: "🖨️ מדפיס" },
+  waiting:  { icon: "⏳", big: "ממתין שמישהו ייכנס ל-Windows",       list: "⏳ ממתין לכניסה ל-Windows" },
   done:     { icon: "✅", big: "הודפס בהצלחה!",                   list: "✅ הודפס" },
   error:    { icon: "❌", big: "ההדפסה לא הצליחה",                 list: "❌ נכשל" },
 };
