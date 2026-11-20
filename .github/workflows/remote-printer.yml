@@ -42,70 +42,83 @@ jobs:
           Copy-Item $exe.FullName installer\SumatraPDF.exe
 
       - name: Build program
-        run: pyinstaller --noconfirm --noconsole --onedir --name RemotePrinter remote_printer.py
+        run: pyinstaller --noconfirm --noconsole --onedir --name RemotePrinter --collect-submodules cryptography --hidden-import win32timezone remote_printer.py
 
       - name: Self-test of the built program
         run: |
           Copy-Item installer\SumatraPDF.exe dist\RemotePrinter\
           $p = Start-Process dist\RemotePrinter\RemotePrinter.exe -ArgumentList "--selftest" -Wait -PassThru
-          Get-Content dist\RemotePrinter\selftest.txt
-          Remove-Item dist\RemotePrinter\selftest.txt, dist\RemotePrinter\SumatraPDF.exe
+          Get-Content dist\RemotePrinter\selftest.txt -ErrorAction SilentlyContinue
+          Get-Content dist\RemotePrinter\crash.txt -ErrorAction SilentlyContinue
+          Get-Content dist\RemotePrinter\remote_printer.log -ErrorAction SilentlyContinue
+          Remove-Item dist\RemotePrinter\selftest.txt, dist\RemotePrinter\SumatraPDF.exe, dist\RemotePrinter\*.log -ErrorAction SilentlyContinue
           if ($p.ExitCode -ne 0) { exit 1 }
 
       - name: Build installer
         run: |
           if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=2.0.${{ github.run_number }} installer\RemotePrinter.iss
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=3.0.${{ github.run_number }} installer\RemotePrinter.iss
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Get-Item dist\RemotePrinter-Setup.exe | Format-List Name, Length
 
-      - name: Test - silent install, autostart entry, live link
+      - name: Test - automatic install, autostart, watchdog, live link, real printing
         run: |
-          $pw = "ci-" + [guid]::NewGuid().ToString("N").Substring(0, 12)
-          $p = Start-Process dist\RemotePrinter-Setup.exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/PASSWORD=$pw", "/LOG=install.log" -Wait -PassThru
+          # 1. install exactly like a user would get it: no parameters, no questions
+          $p = Start-Process dist\RemotePrinter-Setup.exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/LOG=install.log" -Wait -PassThru
           if ($p.ExitCode -ne 0) { Get-Content install.log; exit 1 }
           $app = "$env:LOCALAPPDATA\RemotePrinter"
-          if (-not (Test-Path "$app\RemotePrinter.exe")) { throw "program not installed" }
-          if (-not (Test-Path "$app\SumatraPDF.exe")) { throw "SumatraPDF not installed" }
+          foreach ($f in "RemotePrinter.exe", "SumatraPDF.exe") { if (-not (Test-Path "$app\$f")) { throw "$f not installed" } }
           $run = (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run").RemotePrinter
           Write-Host "Autostart: $run"
           if (-not $run) { throw "autostart entry missing" }
+          schtasks /Query /TN "RemotePrinter Watchdog" /V /FO LIST | Select-String "Task To Run|Repeat|Status"
+          if ($LASTEXITCODE -ne 0) { throw "watchdog task missing" }
           Start-Sleep 8
-          if (-not (Get-Process RemotePrinter -ErrorAction SilentlyContinue)) { Get-Content "$app\remote_printer.log"; throw "program not running" }
-          $cfg = Get-Content "$app\config.ini" -Raw
-          if ($cfg -notmatch "channel") { throw "password was not converted" }
-          python tools\send_test.py --password $pw ping
-          if ($LASTEXITCODE -ne 0) { Get-Content "$app\remote_printer.log"; exit 1 }
+          if (-not (Get-Process RemotePrinter -ErrorAction SilentlyContinue)) { Get-Content "$app\remote_printer.log"; throw "program not running after install" }
+          Get-Content "$app\remote_printer.log"
 
-          # REAL silent print: a test printer whose output goes to a file (no dialogs)
+          # 2. switch this test machine to a throw-away channel (never the real one)
+          $pw = "ci-" + [guid]::NewGuid().ToString("N").Substring(0, 12)
+          $lines = python tools\test_channel.py $pw
+          $topic = ($lines | Select-String "^topic = ").ToString().Split("= ")[-1]
+          $key = ($lines | Select-String "^key = ").ToString().Split("= ")[-1]
           New-Item -ItemType Directory -Force C:\ci | Out-Null
           Add-PrinterPort -Name "C:\ci\printed.pdf"
-          Add-Printer -Name "CI Test Printer" -DriverName "Microsoft Print To PDF" -PortName "C:\ci\printed.pdf"
+          Add-Printer -Name "Pantum CI Test" -DriverName "Microsoft Print To PDF" -PortName "C:\ci\printed.pdf"
           Stop-Process -Name RemotePrinter -Force
-          Add-Content "$app\config.ini" "printer_name = CI Test Printer"
+          Set-Content "$app\config.ini" (@("[general]") + $lines) -Encoding utf8
           Start-Process "$app\RemotePrinter.exe" -WorkingDirectory $app
           Start-Sleep 6
-          python tools\send_test.py --password $pw ping
-          python tools\send_test.py --password $pw print tools\test_page.pdf
+
+          # 3. ping: the program must answer, and must have picked the Pantum printer by itself
+          $reply = python tools\send_test.py --password $pw --topic $topic --key $key ping
+          Write-Host $reply
+          if ($LASTEXITCODE -ne 0) { Get-Content "$app\remote_printer.log"; throw "no answer to ping" }
+          if ("$reply" -notmatch "Pantum CI Test") { throw "Pantum printer was not detected automatically" }
+
+          # 4. wrong password must be ignored
+          python tools\send_test.py --password "wrong-password" --topic $topic --key $key --timeout 20 ping
+          if ($LASTEXITCODE -eq 0) { throw "a message signed with a wrong password was accepted!" }
+
+          # 5. REAL silent print through the Windows spooler, confirmed by the program
+          python tools\send_test.py --password $pw --topic $topic --key $key print tools\test_page.pdf
           if ($LASTEXITCODE -ne 0) { Get-Content "$app\remote_printer.log"; throw "real print failed" }
           Start-Sleep 2
           $out = Get-Item C:\ci\printed.pdf -ErrorAction SilentlyContinue
           if (-not $out -or $out.Length -lt 1000) { Get-Content "$app\remote_printer.log"; throw "printer output missing" }
           Write-Host "Printed output: $($out.Length) bytes"
 
-          # error path, in dry-run mode
-          Stop-Process -Name RemotePrinter -Force
-          Add-Content "$app\config.ini" "dry_run = yes"
-          Start-Process "$app\RemotePrinter.exe" -WorkingDirectory $app
-          Start-Sleep 6
-          # a .txt file is not a supported type -> expect a clean error reply (exit 1)
-          python tools\send_test.py --password $pw print ..\docs\fonts\StamAshkenazCLM-LICENSE.txt
+          # 6. unsupported file -> clean error reply
+          python tools\send_test.py --password $pw --topic $topic --key $key print ..\docs\fonts\StamAshkenazCLM-LICENSE.txt
           if ($LASTEXITCODE -ne 1) { throw "expected an error reply for an unsupported file" }
-          python -c "open('t.pdf','wb').write(b'%PDF-1.4 test')"
-          python tools\send_test.py --password $pw print t.pdf
-          $rc = $LASTEXITCODE
+
+          # 7. watchdog brings the program back
+          Stop-Process -Name RemotePrinter -Force
+          schtasks /Run /TN "RemotePrinter Watchdog"
+          Start-Sleep 6
+          if (-not (Get-Process RemotePrinter -ErrorAction SilentlyContinue)) { throw "watchdog did not restart the program" }
           Get-Content "$app\remote_printer.log"
-          if ($rc -ne 0) { exit 1 }
+          exit 0
 
       - uses: actions/upload-artifact@v4
         with:
@@ -116,11 +129,11 @@ jobs:
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: remote-printer-2.0.${{ github.run_number }}
-          name: הדפסה מרחוק 2.0.${{ github.run_number }}
+          tag_name: remote-printer-3.0.${{ github.run_number }}
+          name: הדפסה מרחוק 3.0.${{ github.run_number }}
           target_commitish: ${{ github.sha }}
           make_latest: true
           files: remote-printer/dist/RemotePrinter-Setup.exe
           body: |
-            תוכנת ההתקנה למחשב שמחובר למדפסת. הכול בפנים, אין צורך להוריד שום דבר נוסף.
+            תוכנת ההתקנה למחשב שמחובר למדפסת. התקנה אוטומטית לגמרי, הכול בפנים.
             אתר ההדפסה: https://motiml77.github.io/NAO-back-pack-face-recognitaion/

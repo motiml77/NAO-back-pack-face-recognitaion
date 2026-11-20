@@ -100,15 +100,16 @@ footer { display: flex; justify-content: space-between; align-items: center; gap
     <h2>כניסה</h2>
     <form id="loginForm">
       <label class="title" for="password">סיסמה</label>
-      <input type="password" id="password" autocomplete="current-password" required minlength="6" placeholder="הסיסמה שנבחרה בהתקנה">
+      <input type="password" id="password" autocomplete="current-password" required minlength="6" placeholder="סיסמת האתר">
       <label class="row" style="margin-top:10px;gap:8px;justify-content:flex-start"><input type="checkbox" id="remember" checked style="flex:0"> <span style="flex:1">לזכור אותי במכשיר הזה</span></label>
       <div style="margin-top:14px"><button class="primary" type="submit" id="loginBtn">כניסה</button></div>
-      <p class="hint">הסיסמה לא נשלחת לשום מקום. היא משמשת להצפנת מה שנשלח, ורק המחשב של המדפסת יודע לפתוח את ההצפנה.</p>
+      <div class="msg" id="loginMsg" role="alert"></div>
+      <p class="hint">הסיסמה לא נשלחת לשום מקום ולא נשמרת. היא משמשת לחתימה על מה שנשלח, והמחשב של המדפסת מדפיס רק דברים שנחתמו בה.</p>
     </form>
     <p class="hint" style="margin-top:16px;border-top:1px solid var(--line);padding-top:12px">
       עוד לא הותקן? במחשב שמחובר למדפסת:
       <a href="https://github.com/motiml77/NAO-back-pack-face-recognitaion/releases/latest/download/RemotePrinter-Setup.exe">הורדת תוכנת ההתקנה</a>
-      (Windows). בזמן ההתקנה בוחרים את הסיסמה.
+      (Windows). ההתקנה אוטומטית לגמרי, בלי שאלות.
     </p>
   </section>
 
@@ -171,6 +172,7 @@ footer { display: flex; justify-content: space-between; align-items: center; gap
 
     <section class="card">
       <h2>לאיזו מדפסת להדפיס</h2>
+      <p class="hint" style="margin:0 0 8px">"אוטומטי" בוחר את מדפסת Pantum שמחוברת למחשב (או את מדפסת ברירת המחדל).</p>
       <select id="printer" disabled><option>ממתין לחיבור למחשב…</option></select>
       <p class="hint" id="printerHint"></p>
     </section>

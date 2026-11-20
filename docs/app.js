@@ -1,4 +1,4 @@
-import { connect, fromSaved } from "./link.js";
+import { login, resume, WrongPassword } from "./link.js";
 import { loadAssets, drawPage, cleanLines, canvasToPdf, PRESETS, MAX_TITLE_LINES, MAX_NAME_LINES } from "./render.js";
 
 const $ = (id) => document.getElementById(id);
@@ -59,14 +59,15 @@ function onPong(msg) {
   clearTimeout(pongTimer);
   health = msg.health || { ready: true, problems: [], warnings: [], name: "" };
   wordOnPc = msg.word !== false;
-  const where = `${health.name || "מדפסת"}${msg.host ? ` · מחשב ${msg.host}` : ""}`;
+  const how = health.how === "auto" && health.name ? " (זוהתה אוטומטית)" : "";
+  const where = `${health.name || "מדפסת"}${how}${msg.host ? ` · מחשב ${msg.host}` : ""}`;
   if (health.ready) {
     const warn = health.warnings?.length ? ` · ${health.warnings.join(", ")}` : "";
     setReady("ok", "✓", "המדפסת מוכנה להדפסה", where + warn);
   } else {
     setReady("warn", "!", "המחשב מחובר, אבל יש בעיה במדפסת", `${health.problems.join(" · ")} (${where})`);
   }
-  fillPrinters(msg.printers || [], msg.printer || "", msg.default || "");
+  fillPrinters(msg.printers || [], msg.printer || "", health.name || "");
   updateFileHint();
 }
 
@@ -138,7 +139,7 @@ function fillPrinters(printers, current, def) {
   const sel = $("printer");
   sel.replaceChildren();
   const opt = (value, text) => { const o = document.createElement("option"); o.value = value; o.textContent = text; sel.append(o); };
-  opt("", `מדפסת ברירת המחדל${def ? ` (${def})` : ""}`);
+  opt("", `אוטומטי${def ? ` (${def})` : ""}`);
   for (const p of printers) opt(p, p);
   sel.value = printers.includes(current) ? current : "";
   sel.disabled = false;
@@ -173,11 +174,15 @@ $("loginForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   $("loginBtn").disabled = true;
   $("loginBtn").textContent = "מתחבר…";
+  $("loginMsg").textContent = "";
   try {
-    const l = await connect($("password").value);
-    if ($("remember").checked) store.set(SAVED_KEY, l.saved); else store.del(SAVED_KEY);
+    const l = await login($("password").value);
+    if ($("remember").checked) store.set(SAVED_KEY, l.seedHex); else store.del(SAVED_KEY);
     $("password").value = "";
     await startSession(l);
+  } catch (err) {
+    $("loginMsg").textContent = err.message || "הכניסה נכשלה";
+    if (err instanceof WrongPassword) $("password").select();
   } finally {
     $("loginBtn").disabled = false;
     $("loginBtn").textContent = "כניסה";
@@ -328,6 +333,6 @@ $("sendFile").addEventListener("click", async () => {
 
 // ================================================================ start
 const saved = store.get(SAVED_KEY, null);
-if (saved?.topic && saved?.key) {
-  fromSaved(saved).then(startSession).catch(() => store.del(SAVED_KEY));
+if (typeof saved === "string" && /^[0-9a-f]{64}$/.test(saved)) {
+  resume(saved).then(startSession).catch(() => store.del(SAVED_KEY));   // password changed -> log in again
 }

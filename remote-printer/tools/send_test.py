@@ -6,6 +6,8 @@
 Exits 0 when the expected reply arrives (pong / status "done").
 """
 import argparse
+import base64
+import hashlib
 import json
 import sys
 import time
@@ -15,6 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import remote_printer as rp   # noqa: E402
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 
 
 def http(url, data=None, method=None):
@@ -26,30 +29,39 @@ def http(url, data=None, method=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--password", required=True)
-    ap.add_argument("--timeout", type=int, default=90)
+    ap.add_argument("--timeout", type=int, default=120)
+    ap.add_argument("--topic", default=rp.CHANNEL_TOPIC)
+    ap.add_argument("--key", default=rp.CHANNEL_KEY)
     ap.add_argument("mode", choices=["ping", "print"])
     ap.add_argument("file", nargs="?")
     a = ap.parse_args()
 
-    ch = rp.Channel(*rp.derive_channel(a.password))
+    ch = rp.Channel(a.topic, a.key, None)
+    signer = Ed25519PrivateKey.from_private_bytes(rp.derive_signing_seed(a.password, a.topic))
+
+    def signed(obj):
+        payload = json.dumps(dict(obj, ts=int(time.time() * 1000)), ensure_ascii=False)
+        sig = base64.b64encode(signer.sign(payload.encode())).decode()
+        return ch.seal_json({"p": payload, "s": sig})
+
     start = int(time.time()) - 2
     if a.mode == "ping":
-        http(f"{rp.RELAY}/{ch.topic}", ch.seal_json({"t": "ping"}).encode(), "POST")
-        want = lambda m: m.get("t") == "pong"
+        http(f"{rp.RELAY}/{ch.topic}", signed({"t": "ping"}).encode(), "POST")
+        want = lambda m: m.get("t") == "pong" and m.get("ts", 0) / 1000 >= start
     else:
+        data = Path(a.file).read_bytes()
         job = "test" + str(int(time.time()))
-        meta = ch.seal_json({"t": "print", "id": job, "name": Path(a.file).name, "label": "test"})
+        meta = signed({"t": "print", "id": job, "name": Path(a.file).name, "label": "test",
+                       "sha": hashlib.sha256(data).hexdigest()})
         url = f"{rp.RELAY}/{ch.topic}?filename=job.bin&message={urllib.parse.quote(meta)}"
-        http(url, ch.encrypt(Path(a.file).read_bytes()), "PUT")
+        http(url, ch.encrypt(data), "PUT")
         want = lambda m: m.get("t") == "status" and m.get("id") == job and m.get("state") in ("done", "error")
 
     deadline = time.time() + a.timeout
     while time.time() < deadline:
-        lines = http(f"{rp.RELAY}/{ch.topic}-s/json?poll=1&since={start}").decode().splitlines()
-        for line in lines:
-            ev = json.loads(line)
+        for line in http(f"{rp.RELAY}/{ch.topic}-s/json?poll=1&since={start}").decode().splitlines():
             try:
-                msg = ch.open_json(ev.get("message", ""))
+                msg = ch.open_json(json.loads(line).get("message", ""))
             except Exception:
                 continue
             if want(msg):

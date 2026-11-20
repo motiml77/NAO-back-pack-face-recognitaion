@@ -8,15 +8,18 @@ It listens (hidden, in the background) for print jobs sent from the
 
 How the link works
 ------------------
-The website and this program talk through ntfy.sh, a free public relay.
-Everything is end-to-end encrypted (AES-256-GCM) with a key derived from the
-password chosen during installation, and the channel name is derived from it
-as well. Messages that are not encrypted with that key are ignored, so only
-someone who knows the password can print. Only outgoing connections are used,
-so no router or firewall configuration is needed.
+The website and this program talk through ntfy.sh, a free public relay, on a
+fixed channel that is built into the program (no setup, no password at install).
+Messages are encrypted (AES-256-GCM), and every command from the website is
+digitally signed (Ed25519) with a key derived from the website password.
+This program only knows the matching *public* key, which it reads from the
+website (channel.json), so it can check signatures but could never sign.
+Unsigned or wrongly signed messages are ignored: only someone who knows the
+website password can print. Changing the password = updating channel.json on
+the website; nothing changes here. Only outgoing connections are used.
 
 Command line (normally not needed - the installer does everything):
-    RemotePrinter.exe                    run (reads config.ini in the program folder)
+    RemotePrinter.exe                    run
     RemotePrinter.exe --test-print FILE  print one local file
     RemotePrinter.exe --selftest         check the installation (writes selftest.txt)
 """
@@ -45,12 +48,17 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-try:   # top-level import so the packager bundles it
+CRYPTO_ERROR = ""
+try:   # top-level imports so the packager bundles them
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-except ImportError:   # pragma: no cover
-    AESGCM = None
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.exceptions import InvalidSignature
+except Exception as _e:   # pragma: no cover
+    AESGCM = Ed25519PublicKey = None
+    InvalidSignature = Exception
+    CRYPTO_ERROR = repr(_e)
 
-VERSION = "2.1"
+VERSION = "3.0"
 FROZEN = getattr(sys, "frozen", False)
 BASE_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.ini"
@@ -59,7 +67,20 @@ IS_WINDOWS = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
 
 RELAY = "https://ntfy.sh"
-KDF_ITERATIONS = 150000
+SITE_URL = "https://motiml77.github.io/NAO-back-pack-face-recognitaion/"
+# Fixed channel shared with the website (docs/channel.json). Not a secret by itself:
+# printing also requires a signature made with the website password.
+CHANNEL_TOPIC = "rpaa34d41e65f38a30074f2c39639fb2f0"
+CHANNEL_KEY = "2f99c66c2cc9af14cde8bf155f9757e913dfddbad07adba3b2c37befe2c983b5"
+VERIFY_REFRESH_SEC = 600
+SIGN_ITERATIONS = 600000
+
+
+def derive_signing_seed(password: str, topic: str = CHANNEL_TOPIC) -> bytes:
+    """Website password -> Ed25519 private seed. Same as docs/link.js. Used only by the tools;
+    the running program never sees the password."""
+    pw = unicodedata.normalize("NFC", password).strip().encode("utf-8")
+    return hashlib.pbkdf2_hmac("sha256", pw, f"remote-printer/sign/v3|{topic}".encode(), SIGN_ITERATIONS, 32)
 MAX_JOB_AGE_SEC = 12 * 3600       # ignore jobs older than this (e.g. after a long shutdown)
 MAX_FILE_BYTES = 16 * 1024 * 1024
 
@@ -204,6 +225,32 @@ JOB_PROBLEMS = [(0x0040, "נגמר הנייר"), (0x0020, "המדפסת לא מ�
                 (0x0002, "שגיאה בהדפסה"), (0x0200, "ההדפסה נחסמה"), (0x0001, "ההדפסה מושהית")]
 
 
+PREFERRED_BRANDS = ("pantum",)      # the printer connected here - picked automatically
+
+
+def is_virtual(name: str) -> bool:
+    return any(v in name.lower() for v in VIRTUAL_PRINTERS)
+
+
+def resolve_printer(configured: str):
+    """Which printer to use. Returns (name, how) - how is 'chosen' / 'auto'.
+    Chosen on the website wins; otherwise a Pantum printer, otherwise the Windows default
+    (if it is a real printer), otherwise the first real printer."""
+    printers, default = list_printers()
+    if configured and configured in printers:
+        return configured, "chosen"
+    for brand in PREFERRED_BRANDS:
+        for p in printers:
+            if brand in p.lower():
+                return p, "auto"
+    if default and not is_virtual(default):
+        return default, "auto"
+    real = [p for p in printers if not is_virtual(p)]
+    if real:
+        return real[0], "auto"
+    return (default or ""), "auto"
+
+
 def word_installed() -> bool:
     if not IS_WINDOWS:
         return False
@@ -216,20 +263,19 @@ def word_installed() -> bool:
 
 
 def printer_health(configured: str) -> dict:
-    """Is the printer ready? Returns {name, ready, problems, warnings}."""
-    printers, default = list_printers()
-    name = configured or default
-    info = {"name": name, "ready": False, "problems": [], "warnings": []}
+    """Is the printer ready? Returns {name, how, ready, problems, warnings}."""
+    printers, _ = list_printers()
+    name, how = resolve_printer(configured)
+    info = {"name": name, "how": how, "ready": False, "problems": [], "warnings": []}
     if not printers:
         info["problems"].append("לא נמצאה אף מדפסת במחשב")
         return info
+    if configured and configured not in printers:
+        info["warnings"].append(f"המדפסת שנבחרה (\"{configured}\") לא נמצאה - נבחרה מדפסת אחרת אוטומטית")
     if not name:
-        info["problems"].append("לא הוגדרה מדפסת ברירת מחדל - בחרו מדפסת באתר")
+        info["problems"].append("לא נמצאה מדפסת - בדקו שהמדפסת מחוברת ודלוקה")
         return info
-    if name not in printers:
-        info["problems"].append(f"המדפסת \"{name}\" לא נמצאה במחשב")
-        return info
-    if any(v in name.lower() for v in VIRTUAL_PRINTERS):
+    if is_virtual(name):
         info["problems"].append("זו מדפסת וירטואלית ששומרת לקובץ - בחרו את המדפסת האמיתית")
     if IS_WINDOWS:
         try:
@@ -308,7 +354,8 @@ def wait_for_printer(name: str, before: dict, timeout=300):
 class Printer:
     def __init__(self, cfg: configparser.ConfigParser):
         g = "general"
-        self.printer_name = cfg.get(g, "printer_name", fallback="").strip()
+        self.configured = cfg.get(g, "printer_name", fallback="").strip()   # chosen on the website ("" = auto)
+        self.printer_name = resolve_printer(self.configured)[0]
         self.dry_run = cfg.getboolean(g, "dry_run", fallback=False)
         self.sumatra = self._find_sumatra(cfg.get(g, "sumatra_path", fallback="").strip())
         self.soffice = self._find_soffice(cfg.get(g, "libreoffice_path", fallback="").strip())
@@ -349,7 +396,7 @@ class Printer:
         return name or "מדפסת ברירת המחדל"
 
     def log_setup(self):
-        log.info("Printer: %s | dry_run=%s", self.printer_name or "<system default>", self.dry_run)
+        log.info("Printer: %s | dry_run=%s", self.printer_name or "<none found>", self.dry_run)
         if IS_WINDOWS:
             log.info("SumatraPDF: %s", self.sumatra or "NOT FOUND (PDF will use the default PDF app)")
         log.info("LibreOffice: %s", self.soffice or "not found")
@@ -527,7 +574,10 @@ class PrintQueue:
             path, source, notify = self.q.get()
             ok, err = True, "נשלח למדפסת"
             try:
-                target = self.printer.printer_name or list_printers()[1]
+                target = resolve_printer(self.printer.configured)[0]
+                self.printer.printer_name = target
+                if not target and not self.printer.dry_run:
+                    raise PrintError("לא נמצאה מדפסת - בדקו שהמדפסת מחוברת ודלוקה")
                 before = {} if self.printer.dry_run else spool_jobs(target)
                 self.printer.print_file(path)
                 if not self.printer.dry_run:
@@ -552,20 +602,49 @@ class PrintQueue:
 
 # --------------------------------------------------------------------------- secure channel
 
-def derive_channel(password: str):
-    """Same derivation as the website (docs/link.js)."""
-    pw = unicodedata.normalize("NFC", password).strip().encode("utf-8")
-    topic = "rp" + hashlib.pbkdf2_hmac("sha256", pw, b"remote-printer/topic/v1", KDF_ITERATIONS, 16).hex()
-    key = hashlib.pbkdf2_hmac("sha256", pw, b"remote-printer/key/v1", KDF_ITERATIONS, 32).hex()
-    return topic, key
+class VerifyKey:
+    """The website's public signing key (docs/channel.json on the website), cached on disk."""
+
+    def __init__(self, cfg, state_get, state_set):
+        self.override = cfg.get("general", "verify_key", fallback="").strip().lower()   # for tests
+        self.state_get, self.state_set = state_get, state_set
+        self.hex = self.override or state_get("verify_key", "")
+        self.fetched = 0.0
+
+    def refresh(self):
+        if self.override:
+            return
+        self.fetched = time.time()
+        try:
+            req = urllib.request.Request(SITE_URL + "channel.json?t=" + str(int(time.time())),
+                                         headers={"User-Agent": USER_AGENT, "Cache-Control": "no-cache"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            if data.get("topic") != CHANNEL_TOPIC:
+                log.warning("channel.json is for a different channel - ignored")
+                return
+            new = (data.get("verify") or "").strip().lower()
+            if re.fullmatch(r"[0-9a-f]{64}", new):
+                if new != self.hex:
+                    log.info("Website signing key %s", "updated" if self.hex else "loaded")
+                self.hex = new
+                self.state_set("verify_key", new)
+        except Exception as e:
+            log.warning("Could not read the website key (%s) - using the saved one", e)
+
+    def get(self):
+        if not self.override and time.time() - self.fetched > VERIFY_REFRESH_SEC:
+            self.refresh()
+        return self.hex
 
 
 class Channel:
-    def __init__(self, topic: str, key_hex: str):
+    def __init__(self, topic: str, key_hex: str, verify):
         if AESGCM is None:
-            raise SystemExit("The 'cryptography' package is missing")
+            raise SystemExit(f"The 'cryptography' package is missing: {CRYPTO_ERROR}")
         self.topic = topic
         self.aes = AESGCM(bytes.fromhex(key_hex))
+        self.verify = verify
 
     def encrypt(self, data: bytes) -> bytes:
         iv = os.urandom(12)
@@ -580,6 +659,26 @@ class Channel:
 
     def open_json(self, text: str):
         return json.loads(self.decrypt(base64.b64decode(text)).decode("utf-8"))
+
+    def _check(self, key_hex, sig: bytes, payload: bytes):
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(key_hex)).verify(sig, payload)
+
+    def open_signed(self, text: str):
+        """Decrypt a command from the website and check its signature. Raises on any problem."""
+        env = self.open_json(text)
+        payload = (env.get("p") or "").encode("utf-8")
+        sig = base64.b64decode(env.get("s") or "")
+        key_hex = self.verify.get()
+        if not key_hex:
+            raise PermissionError("no website key yet")
+        try:
+            self._check(key_hex, sig, payload)
+        except InvalidSignature:
+            if self.verify.override:
+                raise
+            self.verify.refresh()        # the password may have just been changed on the website
+            self._check(self.verify.hex, sig, payload)
+        return json.loads(payload)
 
     def reply(self, obj):
         """Send an encrypted message to the website (status / pong)."""
@@ -601,21 +700,6 @@ class Channel:
                 return
 
 
-def channel_from_config(cfg) -> Channel:
-    g = cfg["general"]
-    password = g.get("password", "").strip()
-    if password:   # first start after installation: keep only the derived values, not the password
-        topic, key = derive_channel(password)
-        g["channel"], g["key"] = topic, key
-        g["password"] = ""
-        save_config(cfg)
-        log.info("Password converted to channel key.")
-    topic, key = g.get("channel", "").strip(), g.get("key", "").strip()
-    if not (topic and key):
-        raise SystemExit("No password configured - run the installer again.")
-    return Channel(topic, key)
-
-
 # --------------------------------------------------------------------------- agent
 
 class Agent:
@@ -627,6 +711,7 @@ class Agent:
         self.inbox = BASE_DIR / "received"
         self.state = self._load_state()
         self.state_lock = threading.Lock()
+        self.last_job = None
 
     # ---- persistent state (last message seen, jobs already handled)
     @staticmethod
@@ -638,6 +723,10 @@ class Agent:
         st.setdefault("last_id", "")
         st.setdefault("jobs", [])
         return st
+
+    def state_put(self, key, value):
+        self.state[key] = value
+        self._save_state()
 
     def _save_state(self):
         with self.state_lock:
@@ -688,9 +777,9 @@ class Agent:
 
     def handle(self, ev):
         try:
-            msg = self.ch.open_json(ev.get("message", ""))
-        except Exception:
-            log.warning("Ignored a message that is not encrypted with our key")
+            msg = self.ch.open_signed(ev.get("message", ""))
+        except Exception as e:
+            log.warning("Ignored a message without a valid website signature (%s)", type(e).__name__)
             return
         age = time.time() - msg.get("ts", 0) / 1000
         if age > MAX_JOB_AGE_SEC or age < -600:
@@ -706,14 +795,14 @@ class Agent:
 
     def pong(self):
         printers, default = list_printers()
-        health = printer_health(self.printer.printer_name)
+        health = printer_health(self.printer.configured)
         if IS_WINDOWS and not self.printer.sumatra:
             health["problems"].append("רכיב ההדפסה חסר - הריצו שוב את ההתקנה")
             health["ready"] = False
         self.ch.reply({"t": "pong", "printers": printers, "default": default,
-                       "printer": self.printer.printer_name, "host": socket.gethostname(),
+                       "printer": self.printer.configured, "host": socket.gethostname(),
                        "version": VERSION, "health": health, "word": word_installed(),
-                       "queue": self.pq.pending()})
+                       "queue": self.pq.pending(), "last_job": self.last_job})
 
     def apply_settings(self, msg):
         name = (msg.get("printer") or "").strip()
@@ -721,7 +810,7 @@ class Agent:
         if name and printers and name not in printers:
             log.warning("Unknown printer from website: %s", name)
             return
-        self.printer.printer_name = name
+        self.printer.configured = name
         self.cfg["general"]["printer_name"] = name
         save_config(self.cfg)
         log.info("Printer set from website: %s", name or "<default>")
@@ -749,6 +838,8 @@ class Agent:
                 raise PrintError("הקובץ גדול מדי")
             data = self._download(url)
             content = self.ch.decrypt(data)
+            if hashlib.sha256(content).hexdigest() != msg.get("sha", ""):
+                raise PrintError("הקובץ לא תואם לחתימה")
             path = unique_path(self.inbox, safe_filename(name))
             path.write_bytes(content)
         except Exception as e:
@@ -760,6 +851,8 @@ class Agent:
         status("printing", detail="המחשב קיבל את הדף ושלח אותו למדפסת")
 
         def notify(ok, detail):
+            self.last_job = {"label": label[:80], "ok": ok, "detail": (detail or "")[:200],
+                             "printer": self.printer.printer_name, "time": int(time.time() * 1000)}
             if ok:
                 status("done", detail=detail)
             else:
@@ -786,19 +879,22 @@ def selftest() -> int:
         nonlocal ok
         try:
             lines.append(f"OK   {name}: {fn()}")
-        except Exception as e:
+        except BaseException as e:
             ok = False
             lines.append(f"FAIL {name}: {e!r}")
 
     def crypto_roundtrip():
-        topic, key = derive_channel("בדיקה-test-1234")
-        ch = Channel(topic, key)
+        if AESGCM is None:
+            raise RuntimeError(CRYPTO_ERROR)
+        ch = Channel(CHANNEL_TOPIC, CHANNEL_KEY, None)
         assert ch.open_json(ch.seal_json({"x": "שלום"}))["x"] == "שלום"
-        return topic
+        Ed25519PublicKey.from_public_bytes(bytes(32))
+        return "AES-GCM + Ed25519"
 
     check("crypto", crypto_roundtrip)
     check("printer list", lambda: list_printers())
     check("printer health", lambda: printer_health(""))
+    check("website key", lambda: VerifyKey(load_config(), lambda k, d: d, lambda k, v: None).get()[:12] or "not reachable")
     check("Word installed", word_installed)
     if IS_WINDOWS:
         check("pywin32", lambda: __import__("win32com.client").__name__)
@@ -834,9 +930,12 @@ def main():
         log.error("Remote Printer is already running - exiting.")
         sys.exit(1)
 
-    channel = channel_from_config(cfg)
     pq = PrintQueue(printer, cfg.getboolean("general", "keep_files", fallback=False))
-    agent = Agent(cfg, channel, printer, pq)
+    agent = Agent(cfg, None, printer, pq)
+    verify = VerifyKey(cfg, lambda k, d: agent.state.get(k, d), agent.state_put)
+    verify.refresh()
+    g = cfg["general"]          # test installations may use their own channel
+    agent.ch = Channel(g.get("topic", "").strip() or CHANNEL_TOPIC, g.get("key", "").strip() or CHANNEL_KEY, verify)
     log.info("Remote Printer %s started.", VERSION)
     try:
         agent.run()
@@ -850,4 +949,9 @@ if __name__ == "__main__":
     except SystemExit as e:
         if e.code not in (None, 0) and not isinstance(e.code, int):
             log.error("%s", e.code)
+        raise
+    except BaseException:   # no console in the installed program - leave a trace for support
+        import traceback
+        (BASE_DIR / "crash.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        log.exception("Crashed")
         raise
