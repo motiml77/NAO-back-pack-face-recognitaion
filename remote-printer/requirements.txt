@@ -1,0 +1,2 @@
+# Only needed on Windows, for printing Word files through Microsoft Word.
+pywin32; sys_platform == "win32"
