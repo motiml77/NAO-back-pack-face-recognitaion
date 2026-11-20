@@ -1,2 +1,4 @@
-# Only needed on Windows, for printing Word files through Microsoft Word.
+# Packaged into the Windows program by the build (see .github/workflows/remote-printer.yml)
+cryptography
+pillow
 pywin32; sys_platform == "win32"

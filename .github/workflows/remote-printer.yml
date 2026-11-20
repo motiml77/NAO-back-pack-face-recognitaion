@@ -108,9 +108,29 @@ jobs:
           if (-not $out -or $out.Length -lt 1000) { Get-Content "$app\remote_printer.log"; throw "printer output missing" }
           Write-Host "Printed output: $($out.Length) bytes"
 
+          # 5b. the exact PDF the website produces, under a Hebrew file name
+          Copy-Item tools\site_sample.pdf "C:\ci\דף מהאתר - בדיקה.pdf"
+          Remove-Item C:\ci\printed.pdf
+          python tools\send_test.py --password $pw --topic $topic --key $key print "C:\ci\דף מהאתר - בדיקה.pdf"
+          if ($LASTEXITCODE -ne 0) { Get-Content "$app\remote_printer.log"; throw "printing the website PDF failed" }
+          Start-Sleep 2
+          $out = Get-Item C:\ci\printed.pdf -ErrorAction SilentlyContinue
+          if (-not $out -or $out.Length -lt 1000) { throw "website PDF produced no printer output" }
+          Write-Host "Website PDF printed: $($out.Length) bytes"
+
+          # 5c. printer problem: pause the printer -> the program must report the problem (+ screenshot)
+          Get-CimInstance Win32_Printer -Filter "Name='Pantum CI Test'" | Invoke-CimMethod -MethodName Pause | Out-Null
+          python tools\send_test.py --password $pw --topic $topic --key $key --expect-error print tools\test_page.pdf
+          if ($LASTEXITCODE -ne 0) { Get-Content "$app\remote_printer.log"; throw "a paused printer was not reported as a problem" }
+          Get-CimInstance Win32_Printer -Filter "Name='Pantum CI Test'" | Invoke-CimMethod -MethodName Resume | Out-Null
+
+          # 5d. screenshot on request
+          python tools\send_test.py --password $pw --topic $topic --key $key --timeout 40 shot
+          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::no screenshot reply (the build machine may have no visible desktop)" }
+
           # 6. unsupported file -> clean error reply
-          python tools\send_test.py --password $pw --topic $topic --key $key print ..\docs\fonts\StamAshkenazCLM-LICENSE.txt
-          if ($LASTEXITCODE -ne 1) { throw "expected an error reply for an unsupported file" }
+          python tools\send_test.py --password $pw --topic $topic --key $key --expect-error print ..\docs\fonts\StamAshkenazCLM-LICENSE.txt
+          if ($LASTEXITCODE -ne 0) { throw "expected an error reply for an unsupported file" }
 
           # 7. watchdog brings the program back
           Stop-Process -Name RemotePrinter -Force

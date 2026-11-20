@@ -28,6 +28,7 @@ import argparse
 import base64
 import configparser
 import hashlib
+import io
 import json
 import logging
 import logging.handlers
@@ -58,7 +59,7 @@ except Exception as _e:   # pragma: no cover
     InvalidSignature = Exception
     CRYPTO_ERROR = repr(_e)
 
-VERSION = "3.0"
+VERSION = "3.1"
 FROZEN = getattr(sys, "frozen", False)
 BASE_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.ini"
@@ -305,6 +306,36 @@ def printer_health(configured: str) -> dict:
     return info
 
 
+def printer_flags(name: str) -> int:
+    """Windows PRINTER_STATUS_* bits for a printer (0 if unknown)."""
+    if not (IS_WINDOWS and name):
+        return 0
+    try:
+        import win32print
+        h = win32print.OpenPrinter(name)
+        try:
+            d = win32print.GetPrinter(h, 2)
+        finally:
+            win32print.ClosePrinter(h)
+        return d.get("Status", 0) | (0x80 if d.get("Attributes", 0) & 0x400 else 0)
+    except Exception:
+        return 0
+
+
+def take_screenshot():
+    """JPEG of the whole screen (all monitors), or None. Used to show the problem on the website."""
+    try:
+        from PIL import ImageGrab
+        img = ImageGrab.grab(all_screens=True)
+        img.thumbnail((1600, 1600))
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, "JPEG", quality=72, optimize=True)
+        return buf.getvalue()
+    except Exception as e:
+        log.warning("Screenshot failed: %s", e)
+        return None
+
+
 def spool_jobs(name: str) -> dict:
     """Windows print queue: {job_id: status}. Empty dict when not available."""
     if not (IS_WINDOWS and name):
@@ -339,9 +370,11 @@ def wait_for_printer(name: str, before: dict, timeout=300):
         if not left:
             return True, "המדפסת סיימה להדפיס"
         problems = [t for st in left.values() for f, t in JOB_PROBLEMS if st & f]
+        flags = printer_flags(name)              # many printers report paper-out etc. only here
+        problems += [t for f, t in PRINTER_PROBLEMS if flags & f]
         if problems:
             problem_since = problem_since or time.time()
-            if time.time() - problem_since > 25:
+            if time.time() - problem_since > 20:
                 return False, problems[0] + " (הדף ממתין בתור ויודפס כשהבעיה תסודר)"
         else:
             problem_since = None
@@ -680,12 +713,19 @@ class Channel:
             self._check(self.verify.hex, sig, payload)
         return json.loads(payload)
 
-    def reply(self, obj):
-        """Send an encrypted message to the website (status / pong)."""
-        body = self.seal_json(obj).encode()
+    def reply(self, obj, attachment: bytes = None):
+        """Send an encrypted message to the website (status / pong), optionally with an
+        encrypted file (screenshot)."""
+        if attachment:
+            body = self.encrypt(attachment)
+            url = f"{RELAY}/{self.topic}-s?filename=shot.bin&message={urllib.parse.quote(self.seal_json(obj))}"
+            method = "PUT"
+        else:
+            body = self.seal_json(obj).encode()
+            url = f"{RELAY}/{self.topic}-s"
+            method = "POST"
         for attempt in range(4):
-            req = urllib.request.Request(f"{RELAY}/{self.topic}-s", data=body,
-                                         headers={"User-Agent": USER_AGENT}, method="POST")
+            req = urllib.request.Request(url, data=body, headers={"User-Agent": USER_AGENT}, method=method)
             try:
                 with urllib.request.urlopen(req, timeout=20) as r:
                     r.read()
@@ -790,6 +830,10 @@ class Agent:
             self.pong()
         elif kind == "settings":
             self.apply_settings(msg)
+        elif kind == "shot":
+            shot = take_screenshot()
+            self.ch.reply({"t": "shot", "id": str(msg.get("id", ""))[:40], "ok": bool(shot),
+                           "error": "" if shot else "לא ניתן לצלם את המסך (אולי המחשב נעול)"}, shot)
         elif kind == "print":
             self.receive_job(msg, ev.get("attachment") or {})
 
@@ -825,7 +869,10 @@ class Agent:
         label = msg.get("label") or msg.get("name") or job_id
 
         def status(state, error="", detail=""):
-            self.ch.reply({"t": "status", "id": job_id, "state": state, "error": error, "detail": detail})
+            obj = {"t": "status", "id": job_id, "state": state, "error": error, "detail": detail}
+            shot = take_screenshot() if state == "error" else None
+            obj["shot"] = bool(shot)
+            self.ch.reply(obj, shot)
 
         try:
             name = msg.get("name") or "document.pdf"
@@ -896,6 +943,7 @@ def selftest() -> int:
     check("printer health", lambda: printer_health(""))
     check("website key", lambda: VerifyKey(load_config(), lambda k, d: d, lambda k, v: None).get()[:12] or "not reachable")
     check("Word installed", word_installed)
+    check("screenshot", lambda: f"{len(take_screenshot() or b'')} bytes")
     if IS_WINDOWS:
         check("pywin32", lambda: __import__("win32com.client").__name__)
         check("SumatraPDF", lambda: Printer._find_sumatra("") or (_ for _ in ()).throw(RuntimeError("missing")))

@@ -5,9 +5,9 @@ const $ = (id) => document.getElementById(id);
 const SAVED_KEY = "rp-link";
 const JOBS_KEY = "rp-jobs";
 const MAX_FILE = 15 * 1024 * 1024;
-const PRINT_W = 2339, PRINT_H = 1654;      // 200 dpi A4 landscape
+const PRINT_SIZES = [[3508, 2480], [2339, 1654]];   // 300 dpi A4 landscape, fallback 200 dpi
 const PONG_TIMEOUT = 12000;
-const RECHECK_EVERY = 2 * 60 * 1000;
+const RECHECK_EVERY = 10 * 60 * 1000;      // the free relay allows ~250 messages a day - be frugal
 
 const store = {
   get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
@@ -80,8 +80,17 @@ const STATE = {
 };
 const resultFor = {};      // job id -> result panel element
 
+function showShot(box, url, caption) {
+  const img = box.querySelector("img");
+  img.src = url;
+  img.onclick = () => window.open(url, "_blank");
+  if (caption !== undefined) box.querySelector(".cap").textContent = caption;
+  box.hidden = false;
+}
+
 function showResult(panel, state, small) {
   panel.hidden = false;
+  if (state !== "error") panel.querySelector(".shotbox").hidden = true;
   panel.className = "result " + state;
   panel.querySelector(".icon").textContent = STATE[state].icon;
   panel.querySelector(".big").textContent = STATE[state].big;
@@ -95,7 +104,7 @@ function saveJob(job) {
   renderJobs();
 }
 
-function onStatus(msg) {
+function onStatus(msg, attachment) {
   const list = jobs();
   const job = list.find((j) => j.id === msg.id);
   if (!job) return;
@@ -107,8 +116,11 @@ function onStatus(msg) {
   if (panel) {
     const small = msg.state === "done"
       ? `המחשב אישר: ${msg.detail || "ההדפסה הסתיימה תקין"}`
-      : (msg.state === "error" ? msg.error : msg.detail);
+      : (msg.state === "error" ? `המחשב דיווח: ${msg.error || "תקלה לא ידועה"}` : msg.detail);
     showResult(panel, msg.state, small);
+    if (msg.state === "error" && msg.shot && attachment) {
+      link.fetchImage(attachment).then((url) => showShot(panel.querySelector(".shotbox"), url)).catch(() => {});
+    }
   }
 }
 
@@ -129,10 +141,38 @@ function renderJobs() {
   }));
 }
 
-function onReply(msg) {
+let shotRequest = null;
+function onReply(msg, attachment) {
   if (msg.t === "pong") onPong(msg);
-  else if (msg.t === "status" && msg.id) onStatus(msg);
+  else if (msg.t === "status" && msg.id) onStatus(msg, attachment);
+  else if (msg.t === "shot" && msg.id && msg.id === shotRequest) {
+    shotRequest = null;
+    $("shotBtn").disabled = false;
+    if (msg.ok && attachment) {
+      link.fetchImage(attachment)
+        .then((url) => showShot($("shotBox"), url, `צילום מסך מהמחשב, ${new Date(msg.ts).toLocaleTimeString("he-IL")} (לחצו להגדלה)`))
+        .catch((e) => { $("printerHint").textContent = e.message; });
+    } else {
+      $("printerHint").textContent = msg.error || "לא התקבל צילום מסך";
+    }
+  }
 }
+
+$("shotBtn").addEventListener("click", async () => {
+  shotRequest = newId();
+  $("shotBtn").disabled = true;
+  $("printerHint").textContent = "מבקש צילום מסך מהמחשב…";
+  try {
+    await link.send({ t: "shot", id: shotRequest });
+  } catch (e) {
+    $("printerHint").textContent = e.message;
+    $("shotBtn").disabled = false;
+    return;
+  }
+  setTimeout(() => {
+    if (shotRequest) { shotRequest = null; $("shotBtn").disabled = false; $("printerHint").textContent = "המחשב לא שלח צילום מסך. האם הוא דלוק?"; }
+  }, 30000);
+});
 
 // ================================================================ printers
 function fillPrinters(printers, current, def) {
@@ -272,6 +312,7 @@ function confirmIfNotReady() {
 async function sendJob(meta, bytes, button, msgEl, panel) {
   msgEl.textContent = "";
   if (!confirmIfNotReady()) return;
+  if (Date.now() - lastPong > 5 * 60 * 1000) check();   // refresh the printer state in the background
   button.disabled = true;
   try {
     const id = newId();
@@ -299,11 +340,20 @@ $("sendName").addEventListener("click", async () => {
     return;
   }
   await assetsReady;
-  const canvas = document.createElement("canvas");
-  canvas.width = PRINT_W;
-  canvas.height = PRINT_H;
-  drawPage(canvas, doc, false);
-  const pdf = await canvasToPdf(canvas);
+  // Print-ready PDF: one A4-landscape page holding the page as a 300 dpi image.
+  // No fonts or layout inside the PDF, so it prints identically on any printer.
+  let pdf = null;
+  for (const [w, h] of PRINT_SIZES) {
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      drawPage(canvas, doc, false);
+      pdf = await canvasToPdf(canvas);
+      break;
+    } catch { /* device could not make such a large image - try smaller */ }
+  }
+  if (!pdf) { $("nameMsg").textContent = "לא הצלחתי להכין את הדף במכשיר הזה."; return; }
   const label = `${doc.title.join(" ")} – ${doc.names.join(", ")}`;
   await sendJob({ name: `${doc.title[0]} - ${doc.names[0]}.pdf`, label }, pdf, $("sendName"), $("nameMsg"), $("nameResult"));
 });

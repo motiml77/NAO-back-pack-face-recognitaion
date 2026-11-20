@@ -32,7 +32,8 @@ def main():
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--topic", default=rp.CHANNEL_TOPIC)
     ap.add_argument("--key", default=rp.CHANNEL_KEY)
-    ap.add_argument("mode", choices=["ping", "print"])
+    ap.add_argument("--expect-error", action="store_true", help="success = an error reply arrives")
+    ap.add_argument("mode", choices=["ping", "print", "shot"])
     ap.add_argument("file", nargs="?")
     a = ap.parse_args()
 
@@ -48,6 +49,10 @@ def main():
     if a.mode == "ping":
         http(f"{rp.RELAY}/{ch.topic}", signed({"t": "ping"}).encode(), "POST")
         want = lambda m: m.get("t") == "pong" and m.get("ts", 0) / 1000 >= start
+    elif a.mode == "shot":
+        sid = "shot" + str(int(time.time()))
+        http(f"{rp.RELAY}/{ch.topic}", signed({"t": "shot", "id": sid}).encode(), "POST")
+        want = lambda m: m.get("t") == "shot" and m.get("id") == sid
     else:
         data = Path(a.file).read_bytes()
         job = "test" + str(int(time.time()))
@@ -60,13 +65,21 @@ def main():
     deadline = time.time() + a.timeout
     while time.time() < deadline:
         for line in http(f"{rp.RELAY}/{ch.topic}-s/json?poll=1&since={start}").decode().splitlines():
+            ev = json.loads(line)
             try:
-                msg = ch.open_json(json.loads(line).get("message", ""))
+                msg = ch.open_json(ev.get("message", ""))
             except Exception:
                 continue
             if want(msg):
                 print("REPLY:", json.dumps(msg, ensure_ascii=False))
-                return 0 if msg.get("state", "done") == "done" else 1
+                att = ev.get("attachment")
+                if att:      # screenshot: download, decrypt, check it is a JPEG
+                    img = ch.decrypt(http(att["url"]))
+                    print(f"SCREENSHOT: {len(img)} bytes, jpeg={img[:2] == bytes([0xFF, 0xD8])}")
+                if a.mode == "shot":
+                    return 0
+                ok = msg.get("state", "done") == "done"
+                return 0 if ok != a.expect_error else 1
         time.sleep(3)
     print("TIMEOUT - no reply")
     return 1
