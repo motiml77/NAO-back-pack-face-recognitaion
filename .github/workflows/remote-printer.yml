@@ -1,0 +1,110 @@
+name: Remote Printer installer
+
+on:
+  push:
+    branches: [main, ccr-9057a387-k9n69g]
+    paths:
+      - "remote-printer/**"
+      - ".github/workflows/remote-printer.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: remote-printer
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller==6.11.1
+
+      - name: Get SumatraPDF (bundled inside the installer)
+        run: |
+          $page = (Invoke-WebRequest "https://www.sumatrapdfreader.org/download-free-pdf-viewer" -UseBasicParsing).Content
+          $m = [regex]::Match($page, 'dl/rel/([\d.]+)/SumatraPDF-[\d.]+-64\.zip')
+          $url = if ($m.Success) { "https://www.sumatrapdfreader.org/" + $m.Value } else { "https://www.sumatrapdfreader.org/dl/rel/3.6.1/SumatraPDF-3.6.1-64.zip" }
+          Write-Host "Downloading $url"
+          Invoke-WebRequest $url -OutFile sumatra.zip
+          Expand-Archive sumatra.zip -DestinationPath sumatra
+          $exe = Get-ChildItem sumatra -Filter *.exe -Recurse | Select-Object -First 1
+          Copy-Item $exe.FullName installer\SumatraPDF.exe
+
+      - name: Build program
+        run: pyinstaller --noconfirm --noconsole --onedir --name RemotePrinter remote_printer.py
+
+      - name: Self-test of the built program
+        run: |
+          Copy-Item installer\SumatraPDF.exe dist\RemotePrinter\
+          $p = Start-Process dist\RemotePrinter\RemotePrinter.exe -ArgumentList "--selftest" -Wait -PassThru
+          Get-Content dist\RemotePrinter\selftest.txt
+          Remove-Item dist\RemotePrinter\selftest.txt, dist\RemotePrinter\SumatraPDF.exe
+          if ($p.ExitCode -ne 0) { exit 1 }
+
+      - name: Build installer
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=2.0.${{ github.run_number }} installer\RemotePrinter.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-Item dist\RemotePrinter-Setup.exe | Format-List Name, Length
+
+      - name: Test - silent install, autostart entry, live link
+        run: |
+          $pw = "ci-" + [guid]::NewGuid().ToString("N").Substring(0, 12)
+          $p = Start-Process dist\RemotePrinter-Setup.exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/PASSWORD=$pw", "/LOG=install.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content install.log; exit 1 }
+          $app = "$env:LOCALAPPDATA\RemotePrinter"
+          if (-not (Test-Path "$app\RemotePrinter.exe")) { throw "program not installed" }
+          if (-not (Test-Path "$app\SumatraPDF.exe")) { throw "SumatraPDF not installed" }
+          $run = (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run").RemotePrinter
+          Write-Host "Autostart: $run"
+          if (-not $run) { throw "autostart entry missing" }
+          Start-Sleep 8
+          if (-not (Get-Process RemotePrinter -ErrorAction SilentlyContinue)) { Get-Content "$app\remote_printer.log"; throw "program not running" }
+          $cfg = Get-Content "$app\config.ini" -Raw
+          if ($cfg -notmatch "channel") { throw "password was not converted" }
+          python tools\send_test.py --password $pw ping
+          if ($LASTEXITCODE -ne 0) { Get-Content "$app\remote_printer.log"; exit 1 }
+
+          # print job end to end, in dry-run mode (the build machine has no real printer)
+          Stop-Process -Name RemotePrinter -Force
+          Add-Content "$app\config.ini" "dry_run = yes"
+          Start-Process "$app\RemotePrinter.exe" -WorkingDirectory $app
+          Start-Sleep 6
+          # a .txt file is not a supported type -> expect a clean error reply (exit 1)
+          python tools\send_test.py --password $pw print ..\docs\fonts\StamAshkenazCLM-LICENSE.txt
+          if ($LASTEXITCODE -ne 1) { throw "expected an error reply for an unsupported file" }
+          python -c "open('t.pdf','wb').write(b'%PDF-1.4 test')"
+          python tools\send_test.py --password $pw print t.pdf
+          $rc = $LASTEXITCODE
+          Get-Content "$app\remote_printer.log"
+          if ($rc -ne 0) { exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RemotePrinter-Setup
+          path: remote-printer/dist/RemotePrinter-Setup.exe
+
+      - name: Publish as a GitHub release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: remote-printer-2.0.${{ github.run_number }}
+          name: הדפסה מרחוק 2.0.${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          files: remote-printer/dist/RemotePrinter-Setup.exe
+          body: |
+            תוכנת ההתקנה למחשב שמחובר למדפסת. הכול בפנים, אין צורך להוריד שום דבר נוסף.
+            אתר ההדפסה: https://motiml77.github.io/NAO-back-pack-face-recognitaion/

@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Remote Printer
-==============
-Runs permanently on a computer that is connected to a printer.
-Receives PDF / Word documents remotely (Telegram bot and/or e-mail) and prints
-them immediately - no dialog, no confirmation, no click on the computer.
+Remote Printer - the program that runs on the computer next to the printer.
 
-Only outgoing connections are used (polling), so no router / port-forwarding
-configuration is needed.
+It listens (hidden, in the background) for print jobs sent from the
+"הדפסה מרחוק" website and prints them immediately, without any dialog.
 
-Usage:
-    python remote_printer.py                      run (reads config.ini next to this file)
-    python remote_printer.py --test-print FILE    print one local file to check the printer setup
-    python remote_printer.py --install-autostart  start automatically when Windows logs in
-    python remote_printer.py --remove-autostart   undo the above
+How the link works
+------------------
+The website and this program talk through ntfy.sh, a free public relay.
+Everything is end-to-end encrypted (AES-256-GCM) with a key derived from the
+password chosen during installation, and the channel name is derived from it
+as well. Messages that are not encrypted with that key are ignored, so only
+someone who knows the password can print. Only outgoing connections are used,
+so no router or firewall configuration is needed.
+
+Command line (normally not needed - the installer does everything):
+    RemotePrinter.exe                    run (reads config.ini in the program folder)
+    RemotePrinter.exe --test-print FILE  print one local file
+    RemotePrinter.exe --selftest         check the installation (writes selftest.txt)
 """
 
 import argparse
+import base64
 import configparser
-import email
-import email.policy
-import imaplib
+import hashlib
 import json
 import logging
 import logging.handlers
@@ -35,26 +38,34 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
-from email.utils import parseaddr
+from datetime import datetime
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
+VERSION = "2.0"
+FROZEN = getattr(sys, "frozen", False)
+BASE_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / "config.ini"
+STATE_PATH = BASE_DIR / "state.json"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
+
+RELAY = "https://ntfy.sh"
+KDF_ITERATIONS = 150000
+MAX_JOB_AGE_SEC = 12 * 3600       # ignore jobs older than this (e.g. after a long shutdown)
+MAX_FILE_BYTES = 16 * 1024 * 1024
 
 PDF_EXT = {".pdf"}
 WORD_EXT = {".doc", ".docx", ".rtf", ".odt"}
 SUPPORTED_EXT = PDF_EXT | WORD_EXT
 
-PRINT_TIMEOUT_SEC = 180          # max time for a single print job before it is killed
-SINGLE_INSTANCE_PORT = 47631     # local port used only to prevent two copies running
-EMAIL_LOOKBACK_DAYS = 3          # ignore unread e-mails older than this
-CREATE_NO_WINDOW = 0x08000000    # Windows: run helper programs without a console window
-AUTOSTART_NAME = "RemotePrinter"
+PRINT_TIMEOUT_SEC = 180
+SINGLE_INSTANCE_PORT = 47631
+CREATE_NO_WINDOW = 0x08000000
+USER_AGENT = f"RemotePrinter/{VERSION}"
 
 log = logging.getLogger("remote_printer")
 
@@ -69,29 +80,29 @@ def setup_logging():
     log.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(threadName)s: %(message)s")
     fh = logging.handlers.RotatingFileHandler(
-        BASE_DIR / "remote_printer.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+        BASE_DIR / "remote_printer.log", maxBytes=1_000_000, backupCount=2, encoding="utf-8")
     fh.setFormatter(fmt)
     log.addHandler(fh)
-    if sys.stderr is not None:            # pythonw.exe has no console
+    if sys.stderr is not None:
         sh = logging.StreamHandler()
         sh.setFormatter(fmt)
         log.addHandler(sh)
 
 
-def load_config(path: Path) -> configparser.ConfigParser:
-    if not path.exists():
-        example = BASE_DIR / "config.example.ini"
-        if example.exists():
-            shutil.copy(example, path)
-            raise SystemExit(f"Created {path.name} from the example - edit it and run again.")
-        raise SystemExit(f"Config file not found: {path}")
+def load_config() -> configparser.ConfigParser:
     cfg = configparser.ConfigParser(interpolation=None)
-    cfg.read(path, encoding="utf-8-sig")
+    if CONFIG_PATH.exists():
+        cfg.read(CONFIG_PATH, encoding="utf-8-sig")
+    if not cfg.has_section("general"):
+        cfg.add_section("general")
     return cfg
 
 
-def split_list(value: str):
-    return [v.strip() for v in re.split(r"[,\s;]+", value or "") if v.strip()]
+def save_config(cfg: configparser.ConfigParser):
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        cfg.write(f)
+    os.replace(tmp, CONFIG_PATH)
 
 
 def safe_filename(name: str) -> str:
@@ -127,8 +138,9 @@ def run_quiet(args, timeout=PRINT_TIMEOUT_SEC):
 
 
 def acquire_single_instance_lock():
-    """Return a bound socket, or None if another copy is already running."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if IS_WINDOWS and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
     try:
         s.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
         s.listen(1)
@@ -136,6 +148,32 @@ def acquire_single_instance_lock():
     except OSError:
         s.close()
         return None
+
+
+def list_printers():
+    """Returns (printers, default_printer)."""
+    if IS_WINDOWS:
+        try:
+            import win32print
+            flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+            names = sorted({p[2] for p in win32print.EnumPrinters(flags)})
+            try:
+                default = win32print.GetDefaultPrinter()
+            except Exception:
+                default = ""
+            return names, default
+        except Exception as e:
+            log.warning("Could not list printers: %s", e)
+            return [], ""
+    names, default = [], ""
+    try:
+        out = subprocess.run(["lpstat", "-e"], capture_output=True, text=True, timeout=10).stdout
+        names = sorted(n.strip() for n in out.splitlines() if n.strip())
+        out = subprocess.run(["lpstat", "-d"], capture_output=True, text=True, timeout=10).stdout
+        default = out.split(":", 1)[1].strip() if ":" in out else ""
+    except Exception:
+        pass
+    return names, default
 
 
 # --------------------------------------------------------------------------- printing
@@ -207,7 +245,7 @@ class Printer:
         if IS_WINDOWS:
             if self.sumatra:
                 target = ["-print-to", self.printer_name] if self.printer_name else ["-print-to-default"]
-                run_quiet([self.sumatra, *target, "-silent", path])
+                run_quiet([self.sumatra, *target, "-print-settings", "fit", "-silent", path])
                 return
             log.warning("SumatraPDF not found - falling back to the default PDF program")
             self._shell_print(path)
@@ -379,277 +417,266 @@ class PrintQueue:
                 except Exception:
                     log.exception("Could not send print result")
 
+# --------------------------------------------------------------------------- secure channel
 
-# --------------------------------------------------------------------------- Telegram
+def derive_channel(password: str):
+    """Same derivation as the website (docs/link.js)."""
+    pw = unicodedata.normalize("NFC", password).strip().encode("utf-8")
+    topic = "rp" + hashlib.pbkdf2_hmac("sha256", pw, b"remote-printer/topic/v1", KDF_ITERATIONS, 16).hex()
+    key = hashlib.pbkdf2_hmac("sha256", pw, b"remote-printer/key/v1", KDF_ITERATIONS, 32).hex()
+    return topic, key
 
-class TelegramBot:
-    API = "https://api.telegram.org"
 
-    def __init__(self, token, allowed_ids, inbox: Path, max_bytes, pq: PrintQueue, printer: Printer):
-        self.token = token
-        self.allowed = set(allowed_ids)
-        self.inbox = inbox
-        self.max_bytes = max_bytes
-        self.pq = pq
-        self.printer = printer
+class Channel:
+    def __init__(self, topic: str, key_hex: str):
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        self.topic = topic
+        self.aes = AESGCM(bytes.fromhex(key_hex))
 
-    def _call(self, method, params=None, timeout=30):
-        data = urllib.parse.urlencode({k: v for k, v in (params or {}).items() if v is not None}).encode()
-        req = urllib.request.Request(f"{self.API}/bot{self.token}/{method}", data=data)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                res = json.loads(r.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:   # never log the URL - it contains the token
+    def encrypt(self, data: bytes) -> bytes:
+        iv = os.urandom(12)
+        return iv + self.aes.encrypt(iv, data, None)
+
+    def decrypt(self, blob: bytes) -> bytes:
+        return self.aes.decrypt(blob[:12], blob[12:], None)
+
+    def seal_json(self, obj) -> str:
+        obj = dict(obj, ts=int(time.time() * 1000))
+        return base64.b64encode(self.encrypt(json.dumps(obj, ensure_ascii=False).encode("utf-8"))).decode()
+
+    def open_json(self, text: str):
+        return json.loads(self.decrypt(base64.b64decode(text)).decode("utf-8"))
+
+    def reply(self, obj):
+        """Send an encrypted message to the website (status / pong)."""
+        body = self.seal_json(obj).encode()
+        for attempt in range(4):
+            req = urllib.request.Request(f"{RELAY}/{self.topic}-s", data=body,
+                                         headers={"User-Agent": USER_AGENT}, method="POST")
             try:
-                desc = json.loads(e.read().decode("utf-8")).get("description", "")
-            except Exception:
-                desc = ""
-            raise RuntimeError(f"Telegram {method}: HTTP {e.code} {desc}") from None
-        if not res.get("ok"):
-            raise RuntimeError(f"Telegram {method}: {res.get('description')}")
-        return res["result"]
-
-    def send(self, chat_id, text, reply_to=None):
-        try:
-            reply = json.dumps({"message_id": reply_to, "allow_sending_without_reply": True}) if reply_to else None
-            self._call("sendMessage", {"chat_id": chat_id, "text": text, "reply_parameters": reply})
-        except Exception as e:
-            log.warning("Could not send Telegram message: %s", e)
-
-    def run(self):
-        offset, delay = None, 5
-        while True:
-            try:
-                me = self._call("getMe")
-                log.info("Telegram bot connected: @%s", me.get("username"))
-                break
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    r.read()
+                return
+            except urllib.error.HTTPError as e:
+                if e.code != 429 or attempt == 3:
+                    log.warning("Could not send reply to the website: %s", e)
+                    return
+                time.sleep(3 * (attempt + 1))     # rate limited - try again shortly
             except Exception as e:
-                log.error("Telegram connection failed: %s (retry in %ss)", e, delay)
-                time.sleep(delay)
-                delay = min(delay * 2, 300)
+                log.warning("Could not send reply to the website: %s", e)
+                return
+
+
+def channel_from_config(cfg) -> Channel:
+    g = cfg["general"]
+    password = g.get("password", "").strip()
+    if password:   # first start after installation: keep only the derived values, not the password
+        topic, key = derive_channel(password)
+        g["channel"], g["key"] = topic, key
+        g["password"] = ""
+        save_config(cfg)
+        log.info("Password converted to channel key.")
+    topic, key = g.get("channel", "").strip(), g.get("key", "").strip()
+    if not (topic and key):
+        raise SystemExit("No password configured - run the installer again.")
+    return Channel(topic, key)
+
+
+# --------------------------------------------------------------------------- agent
+
+class Agent:
+    def __init__(self, cfg, channel: Channel, printer: Printer, pq: PrintQueue):
+        self.cfg = cfg
+        self.ch = channel
+        self.printer = printer
+        self.pq = pq
+        self.inbox = BASE_DIR / "received"
+        self.state = self._load_state()
+        self.state_lock = threading.Lock()
+
+    # ---- persistent state (last message seen, jobs already handled)
+    @staticmethod
+    def _load_state():
+        try:
+            st = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            st = {}
+        st.setdefault("last_id", "")
+        st.setdefault("jobs", [])
+        return st
+
+    def _save_state(self):
+        with self.state_lock:
+            self.state["jobs"] = self.state["jobs"][-300:]
+            tmp = STATE_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.state), encoding="utf-8")
+            os.replace(tmp, STATE_PATH)
+
+    # ---- main loop
+    def run(self):
         delay = 5
         while True:
+            since = self.state["last_id"] or "10m"
+            url = f"{RELAY}/{self.ch.topic}/json?since={urllib.parse.quote(since)}"
             try:
-                updates = self._call("getUpdates", {"timeout": 50, "offset": offset,
-                                                    "allowed_updates": '["message"]'}, timeout=70)
-                delay = 5
-                for upd in updates:
-                    offset = upd["update_id"] + 1
-                    try:
-                        self._handle(upd.get("message"))
-                    except Exception:
-                        log.exception("Error handling Telegram message")
+                req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+                with urllib.request.urlopen(req, timeout=120) as stream:
+                    log.info("Connected - waiting for print jobs.")
+                    delay = 5
+                    for line in self._lines(stream):   # ntfy sends a keepalive every ~45s
+                        ev = json.loads(line)
+                        if ev.get("event") != "message":
+                            continue
+                        try:
+                            self.handle(ev)
+                        except Exception:
+                            log.exception("Error handling message")
+                        self.state["last_id"] = ev.get("id", self.state["last_id"])
+                        self._save_state()
             except Exception as e:
-                log.warning("Telegram polling error: %s (retry in %ss)", e, delay)
+                log.warning("Connection problem: %s (retry in %ss)", e, delay)
                 time.sleep(delay)
-                delay = min(delay * 2, 300)
+                delay = min(delay * 2, 120)
 
-    def _handle(self, msg):
-        if not msg:
+    @staticmethod
+    def _lines(stream):
+        """Yield each line as soon as it arrives (plain readline waits for more data)."""
+        buf = b""
+        while True:
+            chunk = stream.read1(65536)
+            if not chunk:
+                return
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if line.strip():
+                    yield line
+
+    def handle(self, ev):
+        try:
+            msg = self.ch.open_json(ev.get("message", ""))
+        except Exception:
+            log.warning("Ignored a message that is not encrypted with our key")
             return
-        chat_id = msg["chat"]["id"]
-        msg_id = msg.get("message_id")
-        user = msg.get("from") or {}
-        uid = user.get("id")
-        who = " ".join(filter(None, [user.get("first_name"), user.get("last_name")])) or str(uid)
+        age = time.time() - msg.get("ts", 0) / 1000
+        if age > MAX_JOB_AGE_SEC or age < -600:
+            log.info("Ignored an old message (%.0f minutes)", age / 60)
+            return
+        kind = msg.get("t")
+        if kind == "ping":
+            self.pong()
+        elif kind == "settings":
+            self.apply_settings(msg)
+        elif kind == "print":
+            self.receive_job(msg, ev.get("attachment") or {})
 
-        if uid not in self.allowed:
-            log.warning("Rejected Telegram user %s (%s)", uid, who)
-            self.send(chat_id, "⛔ אין לך הרשאה להדפיס במדפסת הזאת.\n"
-                               f"מספר המשתמש שלך: {uid}\n"
-                               "כדי לקבל הרשאה, יש להוסיף את המספר ל-allowed_user_ids בקובץ config.ini.")
+    def pong(self):
+        printers, default = list_printers()
+        self.ch.reply({"t": "pong", "printers": printers, "default": default,
+                       "printer": self.printer.printer_name, "host": socket.gethostname(),
+                       "version": VERSION})
+
+    def apply_settings(self, msg):
+        name = (msg.get("printer") or "").strip()
+        printers, _ = list_printers()
+        if name and printers and name not in printers:
+            log.warning("Unknown printer from website: %s", name)
+            return
+        self.printer.printer_name = name
+        self.cfg["general"]["printer_name"] = name
+        save_config(self.cfg)
+        log.info("Printer set from website: %s", name or "<default>")
+        self.pong()
+
+    def receive_job(self, msg, att):
+        job_id = str(msg.get("id", ""))[:40]
+        if not job_id or job_id in self.state["jobs"]:
+            return
+        self.state["jobs"].append(job_id)
+        self._save_state()
+        label = msg.get("label") or msg.get("name") or job_id
+
+        def status(state, error=""):
+            self.ch.reply({"t": "status", "id": job_id, "state": state, "error": error})
+
+        try:
+            name = msg.get("name") or "document.pdf"
+            if Path(name).suffix.lower() not in SUPPORTED_EXT:
+                raise PrintError("סוג קובץ לא נתמך")
+            url = att.get("url", "")
+            if not url.startswith(RELAY + "/"):
+                raise PrintError("הקובץ לא הגיע (אולי פג תוקפו)")
+            if int(att.get("size") or 0) > MAX_FILE_BYTES:
+                raise PrintError("הקובץ גדול מדי")
+            data = self._download(url)
+            content = self.ch.decrypt(data)
+            path = unique_path(self.inbox, safe_filename(name))
+            path.write_bytes(content)
+        except Exception as e:
+            log.error("Job %s (%s) failed: %s", job_id, label, e)
+            status("error", str(e) if isinstance(e, PrintError) else "הקובץ לא התקבל כראוי")
             return
 
-        text = (msg.get("text") or "").strip()
-        doc = msg.get("document")
-        if doc:
-            try:
-                self._handle_document(chat_id, msg_id, who, doc)
-            except Exception as e:
-                log.exception("Could not receive Telegram file")
-                self.send(chat_id, f"❌ לא הצלחתי לקבל את הקובץ: {e}", msg_id)
-        elif text.startswith("/status"):
-            self.send(chat_id, f"🟢 מחובר.\nמדפסת: {self.printer.describe()}\n"
-                               f"ממתינים בתור: {self.pq.pending()}")
-        else:
-            self.send(chat_id, "🖨️ שלחו לכאן קובץ PDF או Word (doc/docx) והוא יודפס מיד.\n"
-                               "/status - מצב המדפסת")
-
-    def _handle_document(self, chat_id, msg_id, who, doc):
-        name = doc.get("file_name") or "document"
-        ext = Path(name).suffix.lower()
-        if ext not in SUPPORTED_EXT:
-            self.send(chat_id, f"❌ סוג קובץ לא נתמך ({ext or 'ללא סיומת'}). אפשר לשלוח PDF או Word.", msg_id)
-            return
-        if doc.get("file_size", 0) > self.max_bytes:
-            self.send(chat_id, f"❌ הקובץ גדול מדי (מקסימום {self.max_bytes // 1_000_000}MB).", msg_id)
-            return
-
-        info = self._call("getFile", {"file_id": doc["file_id"]})
-        dest = unique_path(self.inbox, safe_filename(name))
-        self._download(f"{self.API}/file/bot{self.token}/{info['file_path']}", dest)
-        log.info("Telegram: received %s from %s", name, who)
+        log.info("Job received: %s", label)
+        status("printing")
 
         def notify(ok, err):
-            if ok:
-                self.send(chat_id, f"✅ נשלח למדפסת: {name}", msg_id)
-            else:
-                self.send(chat_id, f"❌ ההדפסה נכשלה: {name}\n{err}", msg_id)
+            status("done" if ok else "error", "" if ok else (err or "")[:200])
 
-        self.pq.submit(dest, f"Telegram/{who}", notify)
+        self.pq.submit(path, f"site/{label}", notify)
 
-    def _download(self, url, dest: Path):
-        size = 0
+    @staticmethod
+    def _download(url) -> bytes:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = r.read(MAX_FILE_BYTES + 1)
+        if len(data) > MAX_FILE_BYTES:
+            raise PrintError("הקובץ גדול מדי")
+        return data
+
+
+# --------------------------------------------------------------------------- self test (used by the build)
+
+def selftest() -> int:
+    lines, ok = [], True
+
+    def check(name, fn):
+        nonlocal ok
         try:
-            with urllib.request.urlopen(url, timeout=120) as r, open(dest, "wb") as f:
-                while chunk := r.read(65536):
-                    size += len(chunk)
-                    if size > self.max_bytes:
-                        raise PrintError("file too large")
-                    f.write(chunk)
-        except Exception:
-            dest.unlink(missing_ok=True)
-            raise
+            lines.append(f"OK   {name}: {fn()}")
+        except Exception as e:
+            ok = False
+            lines.append(f"FAIL {name}: {e!r}")
 
+    def crypto_roundtrip():
+        topic, key = derive_channel("בדיקה-test-1234")
+        ch = Channel(topic, key)
+        assert ch.open_json(ch.seal_json({"x": "שלום"}))["x"] == "שלום"
+        return topic
 
-# --------------------------------------------------------------------------- E-mail
-
-class EmailWatcher:
-    def __init__(self, cfg: configparser.ConfigParser, inbox: Path, max_bytes, pq: PrintQueue):
-        e = "email"
-        self.server = cfg.get(e, "imap_server", fallback="imap.gmail.com").strip()
-        self.port = cfg.getint(e, "imap_port", fallback=993)
-        self.username = cfg.get(e, "username", fallback="").strip()
-        self.password = cfg.get(e, "password", fallback="").strip()
-        self.folder = cfg.get(e, "folder", fallback="INBOX").strip() or "INBOX"
-        self.allowed = [a.lower() for a in split_list(cfg.get(e, "allowed_senders", fallback=""))]
-        self.secret = cfg.get(e, "subject_secret", fallback="").strip()
-        self.interval = max(10, cfg.getint(e, "check_every_seconds", fallback=30))
-        self.inbox = inbox
-        self.max_bytes = max_bytes
-        self.pq = pq
-        self.imap = None
-        self.skipped = set()   # UIDs already looked at and ignored (don't log them again)
-
-        bad = [a for a in self.allowed if not re.fullmatch(r"[^@\s\"]+@[^@\s\"]+", a)]
-        if bad:
-            raise SystemExit(f"Invalid address in allowed_senders: {bad}")
-
-    def run(self):
-        delay = 10
-        while True:
-            try:
-                self.imap = imaplib.IMAP4_SSL(self.server, self.port, timeout=60)
-                self.imap.login(self.username, self.password)
-                log.info("E-mail connected: %s (allowed senders: %s)", self.username, ", ".join(self.allowed))
-                delay = 10
-                while True:
-                    self._poll()
-                    time.sleep(self.interval)
-            except Exception as e:
-                log.warning("E-mail error: %s (retry in %ss)", e, delay)
-                try:
-                    self.imap.logout()
-                except Exception:
-                    pass
-                time.sleep(delay)
-                delay = min(delay * 2, 600)
-
-    def _poll(self):
-        typ, _ = self.imap.select(self.folder)
-        if typ != "OK":
-            raise RuntimeError(f"cannot open folder {self.folder}")
-        since = (datetime.now() - timedelta(days=EMAIL_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
-        uids = set()
-        for sender in self.allowed:   # only look at mail from allowed senders - never touch other mail
-            typ, data = self.imap.uid("SEARCH", None, "UNSEEN", "SINCE", since, "FROM", f'"{sender}"')
-            if typ == "OK" and data and data[0]:
-                uids.update(data[0].split())
-        for uid in sorted(uids - self.skipped, key=int):
-            typ, data = self.imap.uid("FETCH", uid, "(BODY.PEEK[])")
-            raw = next((p[1] for p in data if isinstance(p, tuple)), None)
-            if typ != "OK" or raw is None:
-                continue
-            try:
-                handled = self._process(raw)
-            except Exception:
-                log.exception("Could not process e-mail %s", uid)
-                handled = False
-            if handled:
-                self.imap.uid("STORE", uid, "+FLAGS", "(\\Seen)")
-            else:
-                self.skipped.add(uid)
-
-    def _process(self, raw: bytes) -> bool:
-        msg = email.message_from_bytes(raw, policy=email.policy.default)
-        sender = parseaddr(str(msg.get("From", "")))[1].lower()
-        subject = str(msg.get("Subject", ""))
-        if sender not in self.allowed:
-            return False
-        if self.secret and self.secret not in subject:
-            log.warning("E-mail from %s ignored: subject does not contain the secret word", sender)
-            return False
-
-        found = 0
-        for part in msg.walk():
-            if part.is_multipart():
-                continue
-            name = part.get_filename()
-            if not name or Path(name).suffix.lower() not in SUPPORTED_EXT:
-                continue
-            payload = part.get_payload(decode=True) or b""
-            if len(payload) > self.max_bytes:
-                log.warning("E-mail attachment %s too large - skipped", name)
-                continue
-            dest = unique_path(self.inbox, safe_filename(name))
-            dest.write_bytes(payload)
-            log.info("E-mail: received %s from %s", name, sender)
-            self.pq.submit(dest, f"E-mail/{sender}")
-            found += 1
-        if not found:
-            log.info("E-mail from %s (%r) has no PDF/Word attachment - ignored", sender, subject)
-        return found > 0
-
-
-# --------------------------------------------------------------------------- autostart
-
-def autostart(install: bool):
-    script = Path(__file__).resolve()
-    if not IS_WINDOWS:
-        print("On Linux use systemd and on macOS use launchd - see README.md")
-        return
-    import winreg
-    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
-        if install:
-            pyw = Path(sys.executable).with_name("pythonw.exe")
-            exe = pyw if pyw.exists() else Path(sys.executable)
-            winreg.SetValueEx(key, AUTOSTART_NAME, 0, winreg.REG_SZ, f'"{exe}" "{script}"')
-            print(f"OK - the program will start automatically at logon:\n  {exe} {script}")
-        else:
-            try:
-                winreg.DeleteValue(key, AUTOSTART_NAME)
-                print("Autostart removed.")
-            except FileNotFoundError:
-                print("Autostart was not installed.")
+    check("crypto", crypto_roundtrip)
+    check("printer list", lambda: list_printers())
+    if IS_WINDOWS:
+        check("pywin32", lambda: __import__("win32com.client").__name__)
+        check("SumatraPDF", lambda: Printer._find_sumatra("") or (_ for _ in ()).throw(RuntimeError("missing")))
+    lines.append("SELFTEST " + ("PASSED" if ok else "FAILED"))
+    (BASE_DIR / "selftest.txt").write_text("\n".join(lines), encoding="utf-8")
+    return 0 if ok else 1
 
 
 # --------------------------------------------------------------------------- main
 
 def main():
-    ap = argparse.ArgumentParser(description="Receive documents remotely and print them.")
-    ap.add_argument("--config", default=str(BASE_DIR / "config.ini"))
-    ap.add_argument("--test-print", metavar="FILE", help="print one local file and exit")
-    ap.add_argument("--install-autostart", action="store_true")
-    ap.add_argument("--remove-autostart", action="store_true")
+    ap = argparse.ArgumentParser(description="Print documents sent from the remote printing website.")
+    ap.add_argument("--test-print", metavar="FILE")
+    ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
-    if args.install_autostart or args.remove_autostart:
-        autostart(args.install_autostart)
-        return
+    if args.selftest:
+        sys.exit(selftest())
 
     setup_logging()
-    cfg = load_config(Path(args.config))
+    cfg = load_config()
     printer = Printer(cfg)
     printer.log_setup()
 
@@ -660,44 +687,15 @@ def main():
 
     lock = acquire_single_instance_lock()
     if lock is None:
-        log.error("Another copy of Remote Printer is already running - exiting.")
+        log.error("Remote Printer is already running - exiting.")
         sys.exit(1)
 
-    inbox = BASE_DIR / "received"
-    max_bytes = int(cfg.getfloat("general", "max_file_mb", fallback=20) * 1_000_000)
-    pq = PrintQueue(printer, cfg.getboolean("general", "keep_files", fallback=True))
-    started = []
-
-    if cfg.getboolean("telegram", "enabled", fallback=False):
-        token = cfg.get("telegram", "bot_token", fallback="").strip()
-        if not token:
-            raise SystemExit("telegram.bot_token is empty in config.ini")
-        ids = []
-        for v in split_list(cfg.get("telegram", "allowed_user_ids", fallback="")):
-            try:
-                ids.append(int(v))
-            except ValueError:
-                raise SystemExit(f"Invalid Telegram user id in allowed_user_ids: {v}")
-        if not ids:
-            log.warning("No allowed_user_ids yet - send /start to the bot to see your id, then add it.")
-        bot = TelegramBot(token, ids, inbox, max_bytes, pq, printer)
-        threading.Thread(target=bot.run, name="telegram", daemon=True).start()
-        started.append("Telegram")
-
-    if cfg.getboolean("email", "enabled", fallback=False):
-        watcher = EmailWatcher(cfg, inbox, max_bytes, pq)
-        if not (watcher.username and watcher.password and watcher.allowed):
-            raise SystemExit("email: username, password and allowed_senders are required")
-        threading.Thread(target=watcher.run, name="email", daemon=True).start()
-        started.append("E-mail")
-
-    if not started:
-        raise SystemExit("Nothing enabled - set enabled = yes under [telegram] and/or [email]")
-
-    log.info("Remote Printer is running (%s). Press Ctrl+C to stop.", " + ".join(started))
+    channel = channel_from_config(cfg)
+    pq = PrintQueue(printer, cfg.getboolean("general", "keep_files", fallback=False))
+    agent = Agent(cfg, channel, printer, pq)
+    log.info("Remote Printer %s started.", VERSION)
     try:
-        while True:
-            time.sleep(3600)
+        agent.run()
     except KeyboardInterrupt:
         log.info("Stopped.")
 

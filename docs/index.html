@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>הדפסה מרחוק</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🖨️</text></svg>">
+<style>
+@font-face { font-family: Stam; src: url(fonts/StamAshkenazCLM.ttf); font-display: block; }
+:root {
+  --bg: #f4f2ee; --card: #fff; --ink: #1d1d1f; --muted: #6b6b70; --line: #e2dfd8;
+  --accent: #2f4a7a; --accent-ink: #fff; --ok: #2e7d32; --warn: #b26a00; --bad: #c62828;
+  --radius: 14px;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 16px/1.5 system-ui, "Segoe UI", Arial, sans-serif;
+}
+.wrap { max-width: 860px; margin: 0 auto; padding: 16px; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 4px 0 16px; flex-wrap: wrap; }
+h1 { font-size: 22px; margin: 0; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 99px;
+        background: var(--card); border: 1px solid var(--line); font-size: 14px; color: var(--muted); }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: #bbb; }
+.dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); } .dot.wait { background: var(--warn); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; margin-bottom: 16px; }
+.card h2 { font-size: 17px; margin: 0 0 12px; }
+label.title { display: block; font-weight: 600; margin: 14px 0 6px; }
+input[type=password], input[type=text], textarea, select {
+  width: 100%; font: inherit; padding: 11px 12px; border: 1px solid var(--line); border-radius: 10px; background: #fff; color: var(--ink);
+}
+textarea { resize: vertical; min-height: 92px; font-size: 18px; }
+textarea:focus, input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+button { font: inherit; cursor: pointer; border-radius: 10px; border: 1px solid var(--line); background: #fff; padding: 10px 16px; color: var(--ink); }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; font-size: 18px; padding: 14px 18px; width: 100%; }
+button:disabled { opacity: .55; cursor: default; }
+.tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+.tabs button { flex: 1; font-weight: 600; }
+.tabs button[aria-selected=true] { background: var(--ink); color: #fff; border-color: var(--ink); }
+.styles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.styles button { font-family: Stam, serif; font-size: 22px; padding: 12px 6px; }
+.styles button[aria-pressed=true] { border: 2px solid var(--accent); background: #eef2f9; }
+.hint { color: var(--muted); font-size: 14px; margin: 6px 0 0; }
+.preview { margin-top: 16px; }
+.preview canvas { width: 100%; height: auto; display: block; border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,.18); background: #fff; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.row > * { flex: 1; }
+.msg { margin-top: 10px; font-size: 15px; min-height: 1.5em; }
+.msg.ok { color: var(--ok); } .msg.bad { color: var(--bad); }
+ul.jobs { list-style: none; margin: 0; padding: 0; }
+ul.jobs li { display: flex; justify-content: space-between; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 15px; }
+ul.jobs li:last-child { border-bottom: 0; }
+.state { white-space: nowrap; }
+.state.done { color: var(--ok); } .state.error { color: var(--bad); } .state.sent, .state.printing { color: var(--warn); }
+.drop { border: 2px dashed var(--line); border-radius: 12px; padding: 22px; text-align: center; color: var(--muted); }
+.drop.has { border-color: var(--accent); color: var(--ink); }
+footer { display: flex; justify-content: space-between; align-items: center; gap: 10px; color: var(--muted); font-size: 14px; flex-wrap: wrap; }
+.link { background: none; border: 0; color: var(--accent); padding: 4px; text-decoration: underline; }
+[hidden] { display: none !important; }
+@media (max-width: 520px) {
+  .styles { grid-template-columns: 1fr; }
+  h1 { font-size: 19px; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>🖨️ הדפסה מרחוק</h1>
+    <span class="pill" id="statusPill" hidden><span class="dot" id="statusDot"></span><span id="statusText">בודק חיבור…</span></span>
+  </header>
+
+  <!-- login -->
+  <section class="card" id="login">
+    <h2>כניסה</h2>
+    <form id="loginForm">
+      <label class="title" for="password">סיסמה</label>
+      <input type="password" id="password" autocomplete="current-password" required minlength="6" placeholder="הסיסמה שנבחרה בהתקנה">
+      <label class="row" style="margin-top:10px;gap:8px;justify-content:flex-start"><input type="checkbox" id="remember" checked style="flex:0"> <span style="flex:1">לזכור אותי במכשיר הזה</span></label>
+      <div style="margin-top:14px"><button class="primary" type="submit" id="loginBtn">כניסה</button></div>
+      <p class="hint">הסיסמה לא נשלחת לשום מקום. היא משמשת להצפנת מה שנשלח, ורק המחשב של המדפסת יודע לפתוח את ההצפנה.</p>
+    </form>
+    <p class="hint" style="margin-top:16px;border-top:1px solid var(--line);padding-top:12px">
+      עוד לא הותקן? במחשב שמחובר למדפסת:
+      <a href="https://github.com/motiml77/NAO-back-pack-face-recognitaion/releases/latest/download/RemotePrinter-Setup.exe">הורדת תוכנת ההתקנה</a>
+      (Windows). בזמן ההתקנה בוחרים את הסיסמה.
+    </p>
+  </section>
+
+  <main id="app" hidden>
+    <div class="tabs" role="tablist">
+      <button role="tab" aria-selected="true" data-tab="name">✍️ הדפסת שם</button>
+      <button role="tab" aria-selected="false" data-tab="file">📄 שליחת קובץ</button>
+    </div>
+
+    <!-- name in a fixed style -->
+    <section class="card" id="tab-name">
+      <h2>בחירת נוסח</h2>
+      <div class="styles" id="styles"></div>
+
+      <label class="title" for="names">שם (אפשר כמה שמות, כל שם בשורה נפרדת)</label>
+      <textarea id="names" placeholder="שרה בת רחל" maxlength="600"></textarea>
+      <p class="hint" id="namesHint">עד 8 שורות.</p>
+
+      <div class="preview">
+        <label class="title">תצוגה מקדימה</label>
+        <canvas id="preview" width="1188" height="840" aria-label="תצוגה מקדימה של הדף"></canvas>
+      </div>
+
+      <div style="margin-top:16px"><button class="primary" id="sendName">🖨️ שליחה להדפסה</button></div>
+      <div class="msg" id="nameMsg" role="status"></div>
+    </section>
+
+    <!-- any file -->
+    <section class="card" id="tab-file" hidden>
+      <h2>שליחת קובץ PDF או Word</h2>
+      <label class="drop" id="drop">
+        <input type="file" id="file" accept=".pdf,.doc,.docx,.rtf,.odt" hidden>
+        <span id="fileLabel">לחצו כאן לבחירת קובץ</span>
+      </label>
+      <p class="hint">עד 15MB. קבצי Word מודפסים רק אם במחשב של המדפסת מותקן Word.</p>
+      <div style="margin-top:14px"><button class="primary" id="sendFile" disabled>🖨️ שליחה להדפסה</button></div>
+      <div class="msg" id="fileMsg" role="status"></div>
+    </section>
+
+    <section class="card">
+      <h2>נשלחו לאחרונה</h2>
+      <ul class="jobs" id="jobs"></ul>
+      <p class="hint" id="noJobs">עדיין לא נשלח כלום מהמכשיר הזה.</p>
+    </section>
+
+    <section class="card">
+      <h2>המדפסת</h2>
+      <div class="row">
+        <select id="printer" disabled><option>ממתין לחיבור למחשב…</option></select>
+        <button id="refresh" style="flex:0 0 auto">רענון</button>
+      </div>
+      <p class="hint" id="printerHint"></p>
+    </section>
+
+    <footer>
+      <span>הכול מוצפן מקצה לקצה.</span>
+      <button class="link" id="logout">יציאה</button>
+    </footer>
+  </main>
+</div>
+<script type="module" src="app.js"></script>
+</body>
+</html>

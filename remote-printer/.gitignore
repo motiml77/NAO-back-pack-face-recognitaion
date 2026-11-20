@@ -1,6 +1,14 @@
 config.ini
+state.json
 received/
 *.log
 *.log.*
-SumatraPDF*.exe
+*.tmp
+selftest.txt
+build/
+dist/
+*.spec
+installer/SumatraPDF.exe
+sumatra/
+sumatra.zip
 __pycache__/
