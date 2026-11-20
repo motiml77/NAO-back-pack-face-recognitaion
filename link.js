@@ -130,6 +130,14 @@ class Link {
     await Link.check(await fetch(url, { method: "PUT", body: await this.encrypt(bytes) }));
   }
 
+  // encrypted file sent by the printer computer (screenshot) -> object URL of the image
+  async fetchImage(attachment) {
+    const res = await fetch(attachment.url);
+    if (!res.ok) throw new Error("התמונה כבר לא זמינה");
+    const plain = await this.decrypt(new Uint8Array(await res.arrayBuffer()));
+    return URL.createObjectURL(new Blob([plain], { type: "image/jpeg" }));
+  }
+
   // replies from the printer computer (pong / job status)
   listen(onMessage, since = "3h") {
     const es = new EventSource(`${this.relay}/${this.topic}-s/sse?since=${since}`);
@@ -137,7 +145,7 @@ class Link {
       try {
         const data = JSON.parse(ev.data);
         if (data.event !== "message" || !data.message) return;
-        onMessage(await this.openReply(data.message));
+        onMessage(await this.openReply(data.message), data.attachment || null);
       } catch { /* not decryptable - ignore */ }
     };
     return es;

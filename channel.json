@@ -1,7 +1,7 @@
 {
   "topic": "rpaa34d41e65f38a30074f2c39639fb2f0",
   "key": "2f99c66c2cc9af14cde8bf155f9757e913dfddbad07adba3b2c37befe2c983b5",
-  "verify": "3a5b0080e0315d665709fe030acc551ea4ae99b003acbae770417fc6ff5d427e",
+  "verify": "bbd2a8091432a6cd515965bc0d316a55412d7f443585d8683b7b67d9eb329bc6",
   "iterations": 600000,
   "salt": "remote-printer/sign/v3|rpaa34d41e65f38a30074f2c39639fb2f0",
   "relay": "https://ntfy.sh"

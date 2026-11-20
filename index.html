@@ -73,6 +73,11 @@ button:disabled { opacity: .55; cursor: default; }
 .result.error { background: var(--bad-bg); border-color: var(--bad); }
 .result.error .big { color: var(--bad); }
 
+.shotbox { margin-top: 12px; }
+.shotbox img { width: 100%; border-radius: 8px; border: 1px solid var(--line); display: block; cursor: zoom-in; }
+.shotbox .cap { font-size: 13px; color: var(--muted); margin-top: 4px; }
+.result { flex-wrap: wrap; }
+.result > .shotbox { flex-basis: 100%; }
 ul.jobs { list-style: none; margin: 0; padding: 0; }
 ul.jobs li { display: flex; justify-content: space-between; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 15px; }
 ul.jobs li:last-child { border-bottom: 0; }
@@ -146,6 +151,7 @@ footer { display: flex; justify-content: space-between; align-items: center; gap
       <div class="msg" id="nameMsg" role="alert"></div>
       <div class="result" id="nameResult" hidden role="status">
         <span class="icon"></span><span><span class="big"></span><span class="small"></span></span>
+        <div class="shotbox" hidden><img alt="צילום מסך מהמחשב של המדפסת"><div class="cap">צילום מסך מהמחשב של המדפסת, ברגע התקלה (לחצו להגדלה)</div></div>
       </div>
     </section>
 
@@ -161,6 +167,7 @@ footer { display: flex; justify-content: space-between; align-items: center; gap
       <div class="msg" id="fileMsg" role="alert"></div>
       <div class="result" id="fileResult" hidden role="status">
         <span class="icon"></span><span><span class="big"></span><span class="small"></span></span>
+        <div class="shotbox" hidden><img alt="צילום מסך מהמחשב של המדפסת"><div class="cap">צילום מסך מהמחשב של המדפסת, ברגע התקלה (לחצו להגדלה)</div></div>
       </div>
     </section>
 
@@ -175,6 +182,8 @@ footer { display: flex; justify-content: space-between; align-items: center; gap
       <p class="hint" style="margin:0 0 8px">"אוטומטי" בוחר את מדפסת Pantum שמחוברת למחשב (או את מדפסת ברירת המחדל).</p>
       <select id="printer" disabled><option>ממתין לחיבור למחשב…</option></select>
       <p class="hint" id="printerHint"></p>
+      <div style="margin-top:12px"><button id="shotBtn" type="button">📷 צילום מסך מהמחשב של המדפסת</button></div>
+      <div class="shotbox" id="shotBox" hidden><img alt="צילום מסך מהמחשב של המדפסת"><div class="cap" id="shotCap"></div></div>
     </section>
 
     <footer>
