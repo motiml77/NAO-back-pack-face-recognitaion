@@ -67,7 +67,7 @@ button:disabled { opacity: .55; cursor: default; }
 .result .icon { font-size: 34px; line-height: 1; }
 .result .big { font-size: 20px; font-weight: 800; display: block; }
 .result .small { font-size: 14px; color: var(--muted); display: block; }
-.result.sent, .result.printing { background: var(--warn-bg); border-color: var(--warn); }
+.result.sent, .result.printing, .result.waiting { background: var(--warn-bg); border-color: var(--warn); }
 .result.done { background: var(--ok-bg); border-color: var(--ok); }
 .result.done .big { color: var(--ok); }
 .result.error { background: var(--bad-bg); border-color: var(--bad); }
@@ -82,7 +82,7 @@ ul.jobs { list-style: none; margin: 0; padding: 0; }
 ul.jobs li { display: flex; justify-content: space-between; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 15px; }
 ul.jobs li:last-child { border-bottom: 0; }
 .state { white-space: nowrap; }
-.state.done { color: var(--ok); } .state.error { color: var(--bad); } .state.sent, .state.printing { color: var(--warn); }
+.state.done { color: var(--ok); } .state.error { color: var(--bad); } .state.sent, .state.printing, .state.waiting { color: var(--warn); }
 .drop { display: block; border: 2px dashed var(--line); border-radius: 12px; padding: 22px; text-align: center; color: var(--muted); cursor: pointer; }
 .drop.has { border-color: var(--accent); color: var(--ink); }
 footer { display: flex; justify-content: space-between; align-items: center; gap: 10px; color: var(--muted); font-size: 14px; flex-wrap: wrap; }

@@ -64,7 +64,7 @@ except Exception as _e:   # pragma: no cover
     InvalidSignature = Exception
     CRYPTO_ERROR = repr(_e)
 
-VERSION = "3.4"
+VERSION = "3.5"
 FROZEN = getattr(sys, "frozen", False)
 IS_WINDOWS = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
@@ -75,7 +75,7 @@ CONFIG_PATH = DATA_DIR / "config.ini"
 STATE_PATH = DATA_DIR / "state.json"
 TASK_NAME = "RemotePrinter"
 NO_USER = "אף משתמש לא מחובר ל-Windows במחשב, ולכן אי אפשר להפעיל את זה כרגע"
-FALLBACK_NOTE = "אף משתמש לא מחובר ל-Windows, וייתכן שמנהל ההתקן של המדפסת דורש משתמש מחובר"
+WAITING_NOTE = "אף משתמש לא מחובר ל-Windows. ההדפסה תצא מיד אחרי שמישהו ייכנס"
 
 RELAY = "https://ntfy.sh"
 SITE_URL = "https://motiml77.github.io/NAO-back-pack-face-recognitaion/"
@@ -361,6 +361,23 @@ def is_system_account() -> bool:
         return False
 
 
+def user_session_ready() -> bool:
+    """True when somebody is logged on to Windows (the console session belongs to a user)."""
+    if not IS_WINDOWS:
+        return True
+    try:
+        import win32api
+        import win32ts
+        sid = win32ts.WTSGetActiveConsoleSessionId()
+        if sid in (0xFFFFFFFF, -1):
+            return False
+        token = win32ts.WTSQueryUserToken(sid)
+        win32api.CloseHandle(token)
+        return True
+    except Exception:
+        return False
+
+
 def run_in_user_session(args, timeout=60, program=None) -> int:
     """Run `program` (default: this program) with `args`, hidden, inside the logged-on user's desktop
     session. Needed for screenshots, Microsoft Word and printer drivers that only print for a real
@@ -484,23 +501,23 @@ def delete_spool_jobs(name: str, ids):
 
 def wait_for_printer(name: str, before: dict, timeout=300):
     """Follow our job in the Windows queue until the printer has finished it.
-    Returns (ok, message)."""
+    Returns (ok, message, dead) - dead=True when the job ended in ERROR and was removed."""
     if not (IS_WINDOWS and name):
-        return True, "נשלח למדפסת"
+        return True, "נשלח למדפסת", False
     ours, t0 = set(), time.time()
     while time.time() - t0 < 15 and not ours:       # wait for the job to show up in the queue
         ours = set(spool_jobs(name)) - set(before)
         if not ours:
             time.sleep(0.5)
     if not ours:     # very fast printers / drivers that hide finished jobs
-        return True, "המדפסת קיבלה את הדף"
+        return True, "המדפסת קיבלה את הדף", False
     problem_since = None
     logged = False
     while time.time() - t0 < timeout:
         jobs = spool_jobs(name)
         left = {j: st for j, st in jobs.items() if j in ours and not st & JOB_DONE}
         if not left:
-            return True, "המדפסת סיימה להדפיס"
+            return True, "המדפסת סיימה להדפיס", False
         problems = [t for st in left.values() for f, t in JOB_PROBLEMS if st & f]
         flags = printer_flags(name)              # many printers report paper-out etc. only here
         problems += [t for f, t in PRINTER_PROBLEMS if flags & f]
@@ -514,12 +531,12 @@ def wait_for_printer(name: str, before: dict, timeout=300):
                 dead = [j for j, st in left.items() if st & 0x2]    # JOB_STATUS_ERROR: will never print
                 if dead:
                     delete_spool_jobs(name, dead)
-                    return False, problems[0] + " (העבודה בוטלה כדי לא לחסום את התור)"
-                return False, problems[0] + " (הדף ממתין בתור ויודפס כשהבעיה תסודר)"
+                    return False, problems[0] + " (העבודה בוטלה כדי לא לחסום את התור)", True
+                return False, problems[0] + " (הדף ממתין בתור ויודפס כשהבעיה תסודר)", False
         else:
             problem_since = None
         time.sleep(1)
-    return False, "ההדפסה עדיין ממתינה בתור של המדפסת"
+    return False, "ההדפסה עדיין ממתינה בתור של המדפסת", False
 
 
 # --------------------------------------------------------------------------- printing
@@ -597,7 +614,8 @@ def word_export_pdf(src: Path, dst: Path):
 class Printer:
     def __init__(self, cfg: configparser.ConfigParser):
         g = "general"
-        self.fallback_note = ""     # set when a job had to be printed as SYSTEM because nobody is logged on
+        self.fallback_used = False  # this job was printed as SYSTEM because nobody is logged on
+        self.user_only = False      # print only through a user's session (never as SYSTEM)
         self.configured = cfg.get(g, "printer_name", fallback="").strip()   # chosen on the website ("" = auto)
         self.printer_name = resolve_printer(self.configured)[0]
         self.dry_run = cfg.getboolean(g, "dry_run", fallback=False)
@@ -674,8 +692,10 @@ class Printer:
                         raise PrintError(f"רכיב ההדפסה נכשל (קוד {rc})")
                     return
                 except NoUserSession:
-                    self.fallback_note = FALLBACK_NOTE
-                    log.info("Nobody is logged on - printing as SYSTEM")
+                    if self.user_only:
+                        raise
+                    self.fallback_used = True
+                    log.info("Nobody is logged on - trying to print as SYSTEM")
             run_quiet([self.sumatra, *args])
         else:
             self._lp(path)
@@ -740,54 +760,119 @@ class Printer:
 
 
 class PrintQueue:
-    """All jobs are printed one at a time, by one worker thread."""
+    """All jobs are printed one at a time, by one worker thread.
 
-    def __init__(self, printer: Printer, keep_files: bool):
+    A job that cannot be printed because nobody is logged on to Windows (and printing as SYSTEM did not
+    work either) is parked, and printed automatically a few seconds after somebody logs on."""
+
+    WAIT_MAX_SEC = 24 * 3600
+
+    def __init__(self, printer: Printer, keep_files: bool, user_ready=None, poll=5.0, settle=10.0):
         self.printer = printer
         self.keep_files = keep_files
+        self.user_ready = user_ready or user_session_ready
+        self.poll, self.settle = poll, settle
         self.q = queue.Queue()
+        self.waiting = []            # [(path, source, notify, since)]
+        self.lock = threading.Lock()
         threading.Thread(target=self._worker, name="printer", daemon=True).start()
+        threading.Thread(target=self._watch_login, name="login-watch", daemon=True).start()
 
-    def submit(self, path: Path, source: str, notify=None):
+    def submit(self, path: Path, source: str, notify=None, mode="auto"):
+        """mode "auto": print as soon as possible. mode "user": only through a logged-on user."""
         log.info("Queued %s (from %s)", path.name, source)
-        self.q.put((path, source, notify))
+        self.q.put((path, source, notify, mode))
 
     def pending(self):
-        return self.q.qsize()
+        return self.q.qsize() + len(self.waiting)
+
+    @staticmethod
+    def _tell(notify, state, detail=""):
+        if notify:
+            try:
+                notify(state, detail)
+            except Exception:
+                log.exception("Could not send print status")
+
+    def _park(self, path, source, notify):
+        with self.lock:
+            self.waiting.append((path, source, notify, time.time()))
+        log.info("Waiting for somebody to log on to Windows: %s", path.name)
+        self._tell(notify, "waiting", WAITING_NOTE)
 
     def _worker(self):
         while True:
-            path, source, notify = self.q.get()
-            ok, err = True, "נשלח למדפסת"
+            path, source, notify, mode = self.q.get()
+            state, detail, parked = "done", "נשלח למדפסת", False
             try:
                 target = resolve_printer(self.printer.configured)[0]
                 self.printer.printer_name = target
                 if not target and not self.printer.dry_run:
                     raise PrintError("לא נמצאה מדפסת - בדקו שהמדפסת מחוברת ודלוקה")
                 before = {} if self.printer.dry_run else spool_jobs(target)
-                self.printer.fallback_note = ""
+                self.printer.fallback_used = False
+                self.printer.user_only = (mode == "user")
                 self.printer.print_file(path)
-                if not self.printer.dry_run:
-                    ok, err = wait_for_printer(target, before)
-                    if not ok and self.printer.fallback_note:
-                        err = f"{err}. {self.printer.fallback_note}"
+                if self.printer.dry_run:
+                    detail = "מצב בדיקה - לא הודפס באמת"
                 else:
-                    err = "מצב בדיקה - לא הודפס באמת"
-                log.info("Printed %s (from %s): %s", path.name, source, err)
+                    ok, detail, dead = wait_for_printer(target, before)
+                    if not ok:
+                        if dead and self.printer.fallback_used:
+                            parked = True          # printing as SYSTEM did not work: wait for a user
+                        else:
+                            state = "error"
+                log.info("Printed %s (from %s): %s", path.name, source, detail)
+            except NoUserSession:
+                parked = True
             except Exception as e:
-                ok, err = False, str(e)
+                state, detail = "error", str(e)
                 log.exception("Printing %s failed", path.name)
-            finally:
-                if not self.keep_files:
-                    try:
-                        path.unlink()
-                    except OSError:
-                        pass
-            if notify:
+            if parked:
+                self._park(path, source, notify)       # the file is kept
+                continue
+            if not self.keep_files:
                 try:
-                    notify(ok, err)
-                except Exception:
-                    log.exception("Could not send print result")
+                    path.unlink()
+                except OSError:
+                    pass
+            self._tell(notify, state, detail)
+
+    def _expire(self):
+        now = time.time()
+        with self.lock:
+            old = [w for w in self.waiting if now - w[3] > self.WAIT_MAX_SEC]
+            self.waiting = [w for w in self.waiting if now - w[3] <= self.WAIT_MAX_SEC]
+        for path, _source, notify, _since in old:
+            self._tell(notify, "error", "לא הודפס: אף אחד לא נכנס ל-Windows תוך 24 שעות")
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    def _watch_login(self):
+        """When somebody logs on, print everything that was waiting for them."""
+        while True:
+            time.sleep(self.poll)
+            if not self.waiting:
+                continue
+            self._expire()
+            try:
+                if not (self.waiting and self.user_ready()):
+                    continue
+                time.sleep(self.settle)         # let the desktop and the user's printers finish loading
+                if not self.user_ready():
+                    continue
+            except Exception:
+                log.exception("Login check failed")
+                continue
+            with self.lock:
+                jobs, self.waiting = self.waiting, []
+            for path, source, notify, _since in jobs:
+                log.info("Somebody logged on - printing %s now", path.name)
+                self._tell(notify, "printing", "נכנסתם ל-Windows, מדפיס עכשיו")
+                self.q.put((path, source, notify, "user"))
+
 
 # --------------------------------------------------------------------------- secure channel
 
@@ -908,7 +993,7 @@ class Agent:
         self.pq = pq
         self.inbox = DATA_DIR / "received"
         self.state = self._load_state()
-        self.state_lock = threading.Lock()
+        self.state_lock = threading.RLock()
         self.last_job = None
 
     # ---- persistent state (last message seen, jobs already handled)
@@ -931,7 +1016,13 @@ class Agent:
             self.state["jobs"] = self.state["jobs"][-300:]
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             tmp = STATE_PATH.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.state), encoding="utf-8")
+            for _ in range(5):          # another thread may change the state while it is written
+                try:
+                    data = json.dumps(self.state)
+                    break
+                except RuntimeError:
+                    time.sleep(0.01)
+            tmp.write_text(data, encoding="utf-8")
             os.replace(tmp, STATE_PATH)
 
     # ---- main loop
@@ -1019,6 +1110,48 @@ class Agent:
         log.info("Printer set from website: %s", name or "<default>")
         self.pong()
 
+    def _status(self, job_id, state, error="", detail=""):
+        obj = {"t": "status", "id": job_id, "state": state, "error": error, "detail": detail}
+        shot = take_screenshot() if state == "error" else None
+        obj["shot"] = bool(shot)
+        self.ch.reply(obj, shot)
+
+    def _remember_waiting(self, job_id, path, label):
+        with self.state_lock:
+            self.state.setdefault("waiting", {})[job_id] = {"path": str(path), "label": label, "since": int(time.time())}
+            self._save_state()
+
+    def _forget_waiting(self, job_id):
+        with self.state_lock:
+            if self.state.setdefault("waiting", {}).pop(job_id, None) is not None:
+                self._save_state()
+
+    def _make_notify(self, job_id, label, path):
+        """Callback for the print queue: state is waiting / printing / done / error."""
+        def notify(state, detail=""):
+            if state in ("done", "error"):
+                self.last_job = {"label": label[:80], "ok": state == "done", "detail": (detail or "")[:200],
+                                 "printer": self.printer.printer_name, "time": int(time.time() * 1000)}
+                self._forget_waiting(job_id)
+            elif state == "waiting":
+                self._remember_waiting(job_id, path, label)     # survives a restart of the program
+            if state == "error":
+                self._status(job_id, "error", error=(detail or "")[:200])
+            else:
+                self._status(job_id, state, detail=detail)
+        return notify
+
+    def restore_waiting(self):
+        """Jobs that were waiting for somebody to log on when the program last stopped."""
+        for job_id, w in list(self.state.get("waiting", {}).items()):
+            path = Path(w.get("path", ""))
+            notify = self._make_notify(job_id, w.get("label", job_id), path)
+            if not path.exists() or time.time() - w.get("since", 0) > PrintQueue.WAIT_MAX_SEC:
+                PrintQueue._tell(notify, "error", "לא הודפס: הקובץ כבר לא זמין")
+                continue
+            log.info("Restored a job that was waiting for a user: %s", w.get("label"))
+            self.pq.submit(path, "restored", notify, mode="user")
+
     def receive_job(self, msg, att):
         job_id = str(msg.get("id", ""))[:40]
         if not job_id or job_id in self.state["jobs"]:
@@ -1026,12 +1159,6 @@ class Agent:
         self.state["jobs"].append(job_id)
         self._save_state()
         label = msg.get("label") or msg.get("name") or job_id
-
-        def status(state, error="", detail=""):
-            obj = {"t": "status", "id": job_id, "state": state, "error": error, "detail": detail}
-            shot = take_screenshot() if state == "error" else None
-            obj["shot"] = bool(shot)
-            self.ch.reply(obj, shot)
 
         try:
             name = msg.get("name") or "document.pdf"
@@ -1050,21 +1177,12 @@ class Agent:
             path.write_bytes(content)
         except Exception as e:
             log.error("Job %s (%s) failed: %s", job_id, label, e)
-            status("error", str(e) if isinstance(e, PrintError) else "הקובץ לא התקבל כראוי")
+            self._status(job_id, "error", error=str(e) if isinstance(e, PrintError) else "הקובץ לא התקבל כראוי")
             return
 
         log.info("Job received: %s", label)
-        status("printing", detail="המחשב קיבל את הדף ושלח אותו למדפסת")
-
-        def notify(ok, detail):
-            self.last_job = {"label": label[:80], "ok": ok, "detail": (detail or "")[:200],
-                             "printer": self.printer.printer_name, "time": int(time.time() * 1000)}
-            if ok:
-                status("done", detail=detail)
-            else:
-                status("error", error=(detail or "")[:200])
-
-        self.pq.submit(path, f"site/{label}", notify)
+        self._status(job_id, "printing", detail="המחשב קיבל את הדף ושלח אותו למדפסת")
+        self.pq.submit(path, f"site/{label}", self._make_notify(job_id, label, path))
 
     @staticmethod
     def _download(url) -> bytes:
@@ -1316,6 +1434,7 @@ def main():
     agent.ch = Channel(g.get("topic", "").strip() or os.environ.get("RP_TOPIC", "").strip() or CHANNEL_TOPIC,
                        g.get("key", "").strip() or os.environ.get("RP_KEY", "").strip() or CHANNEL_KEY, verify)
     log.info("Remote Printer %s started.", VERSION)
+    agent.restore_waiting()
     try:
         agent.run()
     except KeyboardInterrupt:
