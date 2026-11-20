@@ -54,7 +54,7 @@ button:disabled { opacity: .55; cursor: default; }
 .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
 .tabs button { flex: 1; font-weight: 600; }
 .tabs button[aria-selected=true] { background: var(--ink); color: #fff; border-color: var(--ink); }
-.presets { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.presets { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
 .presets button { font-family: Stam, serif; font-size: 21px; padding: 11px 4px; }
 .presets button[aria-pressed=true] { border: 2px solid var(--accent); background: #eef2f9; }
 .hint { color: var(--muted); font-size: 14px; margin: 6px 0 0; }
