@@ -1,16 +1,16 @@
-﻿; Remote Printer - Windows installer (Inno Setup 6)
+﻿; Remote Printer - Windows installer (Inno Setup 6) for Windows 10 (1809+) and Windows 11, 64-bit.
 ;
-; Fully automatic: no questions, no password, no administrator prompt.
-; Everything is inside: the program, the Python runtime and libraries, SumatraPDF.
-; After installing, the program runs immediately (no restart), starts hidden at every
-; logon, and a watchdog task restarts it within 5 minutes if it ever stops.
+; Fully automatic: no pages and no questions (Windows asks "Yes" once - UAC - because the program
+; is installed for the whole computer). Everything is inside: the program, the Python runtime and
+; libraries, and SumatraPDF. The program then runs as a scheduled task under the SYSTEM account:
+; it starts at every boot - before anybody logs in - with full permissions, and runs right away
+; after the installation (no restart).
 
 #define AppName "הדפסה מרחוק"
 #define AppExe "RemotePrinter.exe"
 #define SiteUrl "https://motiml77.github.io/NAO-back-pack-face-recognitaion/"
-#define Watchdog "RemotePrinter Watchdog"
 #ifndef AppVersion
-  #define AppVersion "3.0"
+  #define AppVersion "3.2"
 #endif
 
 [Setup]
@@ -18,19 +18,23 @@ AppId={{6E0B7C1A-5D2F-4E8B-9A33-2B6A4F1C9D70}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher=Remote Printer
-DefaultDirName={localappdata}\RemotePrinter
-PrivilegesRequired=lowest
+AppPublisherURL={#SiteUrl}
+DefaultDirName={autopf}\RemotePrinter
+PrivilegesRequired=admin
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+MinVersion=10.0.17763
+ShowLanguageDialog=no
 DisableWelcomePage=yes
 DisableDirPage=yes
 DisableProgramGroupPage=yes
 DisableReadyPage=yes
 DisableFinishedPage=yes
-AlwaysShowComponentsList=no
-CloseApplications=force
+CloseApplications=no
 RestartApplications=no
 OutputDir=..\dist
 OutputBaseFilename=RemotePrinter-Setup
-Compression=lzma2/max
+Compression=lzma2/normal
 SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayName={#AppName}
@@ -44,32 +48,25 @@ Name: "he"; MessagesFile: "compiler:Languages\Hebrew.isl"
 Source: "..\dist\RemotePrinter\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "SumatraPDF.exe"; DestDir: "{app}"; Flags: ignoreversion
 
-[Registry]
-; start hidden every time this user logs in to Windows
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "RemotePrinter"; ValueData: """{app}\{#AppExe}"""; Flags: uninsdeletevalue
-
 [Run]
-; keep the computer awake while on mains power, so it can always print
-Filename: "{sys}\powercfg.exe"; Parameters: "/change standby-timeout-ac 0"; Flags: runhidden
-Filename: "{sys}\powercfg.exe"; Parameters: "/change hibernate-timeout-ac 0"; Flags: runhidden
-; watchdog: every 5 minutes make sure the program is running (a second copy exits at once)
-Filename: "{sys}\schtasks.exe"; Parameters: "/Create /F /SC MINUTE /MO 5 /TN ""{#Watchdog}"" /TR ""\""{app}\{#AppExe}\"""""; Flags: runhidden
-; start now - no restart needed
-Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"; Flags: nowait runhidden
+; registers the startup task (SYSTEM, at boot), power settings, and starts the program now
+Filename: "{app}\{#AppExe}"; Parameters: "--setup"; Flags: runhidden waituntilterminated
 
 [UninstallRun]
-Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /F /TN ""{#Watchdog}"""; Flags: runhidden; RunOnceId: "DelWatchdog"
+Filename: "{app}\{#AppExe}"; Parameters: "--remove"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveTasks"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#AppExe}"; Flags: runhidden; RunOnceId: "StopRemotePrinter"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
+Type: filesandordirs; Name: "{commonappdata}\RemotePrinter"
 
 [Code]
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
 begin
-  // stop a running copy so its files can be replaced (settings in config.ini are kept)
+  // stop a running copy so its files can be replaced (settings in ProgramData are kept)
+  Exec(ExpandConstant('{sys}\schtasks.exe'), '/End /TN RemotePrinter', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#AppExe}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Sleep(1000);
   Result := '';

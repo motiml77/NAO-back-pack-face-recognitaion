@@ -77,7 +77,7 @@ def main():
                     img = ch.decrypt(http(att["url"]))
                     print(f"SCREENSHOT: {len(img)} bytes, jpeg={img[:2] == bytes([0xFF, 0xD8])}")
                 if a.mode == "shot":
-                    return 0
+                    return 0 if msg.get("ok") else 2
                 ok = msg.get("state", "done") == "done"
                 return 0 if ok != a.expect_error else 1
         time.sleep(3)

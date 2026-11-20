@@ -18,6 +18,11 @@ Unsigned or wrongly signed messages are ignored: only someone who knows the
 website password can print. Changing the password = updating channel.json on
 the website; nothing changes here. Only outgoing connections are used.
 
+Runs as a Windows scheduled task under the SYSTEM account: it starts when the computer
+boots - before anybody logs in - so printing works after any power cut or restart.
+Things that need a person's desktop (screenshots, Microsoft Word) are done by a short
+helper process that this program starts inside the logged-on user's session.
+
 Command line (normally not needed - the installer does everything):
     RemotePrinter.exe                    run
     RemotePrinter.exe --test-print FILE  print one local file
@@ -59,20 +64,24 @@ except Exception as _e:   # pragma: no cover
     InvalidSignature = Exception
     CRYPTO_ERROR = repr(_e)
 
-VERSION = "3.1"
+VERSION = "3.2"
 FROZEN = getattr(sys, "frozen", False)
-BASE_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
-CONFIG_PATH = BASE_DIR / "config.ini"
-STATE_PATH = BASE_DIR / "state.json"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
+BASE_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent   # program files
+# Settings, logs and received files live apart from the program (Program Files is read-only for users).
+DATA_DIR = (Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "RemotePrinter") if (IS_WINDOWS and FROZEN) else BASE_DIR
+CONFIG_PATH = DATA_DIR / "config.ini"
+STATE_PATH = DATA_DIR / "state.json"
+TASK_NAME = "RemotePrinter"
+NO_USER = "אף משתמש לא מחובר ל-Windows במחשב, ולכן אי אפשר להפעיל את זה כרגע"
 
 RELAY = "https://ntfy.sh"
 SITE_URL = "https://motiml77.github.io/NAO-back-pack-face-recognitaion/"
 # Fixed channel shared with the website (docs/channel.json). Not a secret by itself:
 # printing also requires a signature made with the website password.
-CHANNEL_TOPIC = "rpaa34d41e65f38a30074f2c39639fb2f0"
-CHANNEL_KEY = "2f99c66c2cc9af14cde8bf155f9757e913dfddbad07adba3b2c37befe2c983b5"
+CHANNEL_TOPIC = "rp4b664a92fc23d7ad321f82c438f1e2c6"
+CHANNEL_KEY = "92070395d36a1820bef31c8961a2797e2af8674736617e0fbbbcf33c28c87468"
 VERIFY_REFRESH_SEC = 600
 SIGN_ITERATIONS = 600000
 
@@ -104,10 +113,11 @@ class PrintError(Exception):
 # --------------------------------------------------------------------------- helpers
 
 def setup_logging():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     log.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(threadName)s: %(message)s")
     fh = logging.handlers.RotatingFileHandler(
-        BASE_DIR / "remote_printer.log", maxBytes=1_000_000, backupCount=2, encoding="utf-8")
+        DATA_DIR / "remote_printer.log", maxBytes=1_000_000, backupCount=2, encoding="utf-8")
     fh.setFormatter(fmt)
     log.addHandler(fh)
     if sys.stderr is not None:
@@ -126,6 +136,7 @@ def load_config() -> configparser.ConfigParser:
 
 
 def save_config(cfg: configparser.ConfigParser):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     tmp = CONFIG_PATH.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         cfg.write(f)
@@ -322,18 +333,105 @@ def printer_flags(name: str) -> int:
         return 0
 
 
-def take_screenshot():
-    """JPEG of the whole screen (all monitors), or None. Used to show the problem on the website."""
+def is_system_account() -> bool:
+    """True when running as LocalSystem (the installed scheduled task)."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        import win32process
+        import win32security
+        tok = win32security.OpenProcessToken(win32process.GetCurrentProcess(), win32security.TOKEN_QUERY)
+        sid = win32security.GetTokenInformation(tok, win32security.TokenUser)[0]
+        return win32security.ConvertSidToStringSid(sid) == "S-1-5-18"
+    except Exception:
+        return False
+
+
+def run_in_user_session(args, timeout=60) -> int:
+    """Run this program with `args` hidden inside the logged-on user's desktop session
+    (needed for screenshots and Microsoft Word, which do not work from the SYSTEM session).
+    Returns the exit code. Raises PrintError if nobody is logged on."""
+    import pywintypes
+    import win32api
+    import win32event
+    import win32process
+    import win32profile
+    import win32ts
+
+    sid = win32ts.WTSGetActiveConsoleSessionId()
+    if sid in (0xFFFFFFFF, -1):
+        raise PrintError(NO_USER)
+    try:
+        token = win32ts.WTSQueryUserToken(sid)
+    except pywintypes.error:
+        raise PrintError(NO_USER)
+    try:
+        env = win32profile.CreateEnvironmentBlock(token, False)
+        si = win32process.STARTUPINFO()
+        si.lpDesktop = "winsta0\\default"
+        si.dwFlags = win32process.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0   # SW_HIDE
+        prefix = [sys.executable] if FROZEN else [sys.executable, str(Path(__file__).resolve())]
+        cmdline = subprocess.list2cmdline(prefix + [str(a) for a in args])
+        h_proc, h_thread, _, _ = win32process.CreateProcessAsUser(
+            token, None, cmdline, None, None, False, 0x08000000 | 0x00000400,   # NO_WINDOW | UNICODE_ENV
+            env, str(BASE_DIR), si)
+    finally:
+        win32api.CloseHandle(token)
+    try:
+        win32api.CloseHandle(h_thread)
+        if win32event.WaitForSingleObject(h_proc, int(timeout * 1000)) != win32event.WAIT_OBJECT_0:
+            win32process.TerminateProcess(h_proc, 1)
+            raise PrintError("פעולה בחלון המשתמש לא הסתיימה בזמן")
+        return win32process.GetExitCodeProcess(h_proc)
+    finally:
+        win32api.CloseHandle(h_proc)
+
+
+SHOT_ERROR = {"text": ""}
+
+
+def _grab_screen():
+    """JPEG bytes of the screen in THIS process, or None (sets SHOT_ERROR)."""
     try:
         from PIL import ImageGrab
         img = ImageGrab.grab(all_screens=True)
+        if img.convert("L").getextrema()[1] < 8:
+            SHOT_ERROR["text"] = "המסך שחור או נעול"
+            return None
         img.thumbnail((1600, 1600))
         buf = io.BytesIO()
         img.convert("RGB").save(buf, "JPEG", quality=72, optimize=True)
         return buf.getvalue()
     except Exception as e:
+        SHOT_ERROR["text"] = "לא ניתן לצלם את המסך (אולי המחשב נעול)"
         log.warning("Screenshot failed: %s", e)
         return None
+
+
+def take_screenshot():
+    """JPEG of the whole screen (all monitors), or None. Used to show the problem on the website."""
+    SHOT_ERROR["text"] = ""
+    if is_system_account():       # the screen belongs to the logged-on user - ask a helper in that session
+        out = DATA_DIR / "tmp" / f"shot-{os.getpid()}-{int(time.time())}.jpg"
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            rc = run_in_user_session(["--screenshot", out], timeout=30)
+            if rc == 0 and out.exists():
+                return out.read_bytes()
+            SHOT_ERROR["text"] = "המסך נעול או שחור, לא ניתן לצלם"
+        except PrintError as e:
+            SHOT_ERROR["text"] = str(e)
+        except Exception as e:
+            SHOT_ERROR["text"] = "לא ניתן לצלם את המסך"
+            log.warning("Screenshot helper failed: %s", e)
+        finally:
+            try:
+                out.unlink()
+            except OSError:
+                pass
+        return None
+    return _grab_screen()
 
 
 def spool_jobs(name: str) -> dict:
@@ -477,6 +575,23 @@ class Printer:
 
     # ---- Word
     def _print_word(self, path: Path):
+        if is_system_account():       # Word cannot run in the SYSTEM session - use the logged-on user's
+            err = DATA_DIR / "tmp" / f"word-{os.getpid()}.err"
+            try:
+                err.parent.mkdir(parents=True, exist_ok=True)
+                rc = run_in_user_session(["--print-word", path, self.printer_name, err], timeout=PRINT_TIMEOUT_SEC + 30)
+                if rc != 0:
+                    raise PrintError(err.read_text(encoding="utf-8").strip() if err.exists()
+                                     else f"הדפסת Word נכשלה (קוד {rc})")
+            finally:
+                try:
+                    err.unlink()
+                except OSError:
+                    pass
+            return
+        self._print_word_direct(path)
+
+    def _print_word_direct(self, path: Path):
         if IS_WINDOWS:
             try:
                 import win32com.client  # noqa: F401  (pywin32)
@@ -667,7 +782,8 @@ class VerifyKey:
             log.warning("Could not read the website key (%s) - using the saved one", e)
 
     def get(self):
-        if not self.override and time.time() - self.fetched > VERIFY_REFRESH_SEC:
+        interval = VERIFY_REFRESH_SEC if self.hex else 30       # no key yet (first start offline): retry quickly
+        if not self.override and time.time() - self.fetched > interval:
             self.refresh()
         return self.hex
 
@@ -749,7 +865,7 @@ class Agent:
         self.ch = channel
         self.printer = printer
         self.pq = pq
-        self.inbox = BASE_DIR / "received"
+        self.inbox = DATA_DIR / "received"
         self.state = self._load_state()
         self.state_lock = threading.Lock()
         self.last_job = None
@@ -772,6 +888,7 @@ class Agent:
     def _save_state(self):
         with self.state_lock:
             self.state["jobs"] = self.state["jobs"][-300:]
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
             tmp = STATE_PATH.with_suffix(".tmp")
             tmp.write_text(json.dumps(self.state), encoding="utf-8")
             os.replace(tmp, STATE_PATH)
@@ -834,7 +951,7 @@ class Agent:
         elif kind == "shot":
             shot = take_screenshot()
             self.ch.reply({"t": "shot", "id": str(msg.get("id", ""))[:40], "ok": bool(shot),
-                           "error": "" if shot else "לא ניתן לצלם את המסך (אולי המחשב נעול)"}, shot)
+                           "error": "" if shot else (SHOT_ERROR["text"] or "לא ניתן לצלם את המסך")}, shot)
         elif kind == "print":
             self.receive_job(msg, ev.get("attachment") or {})
 
@@ -918,6 +1035,141 @@ class Agent:
         return data
 
 
+# --------------------------------------------------------------------------- installation (admin)
+
+def task_xml(exe: Path) -> str:
+    """Scheduled task: SYSTEM, highest privileges, starts at boot (before login), at every logon and
+    every 5 minutes (one copy only), restarts itself if it ever fails, no time limit, battery allowed."""
+    from xml.sax.saxutils import escape
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Remote Printer - prints documents sent from the website</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <BootTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT15S</Delay>
+    </BootTrigger>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT10S</Delay>
+    </LogonTrigger>
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2020-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>6</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>999</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{escape(str(exe))}</Command>
+      <WorkingDirectory>{escape(str(exe.parent))}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"""
+
+
+def _run(args, **kw):
+    kw.setdefault("capture_output", True)
+    kw.setdefault("timeout", 120)
+    if IS_WINDOWS:
+        kw["creationflags"] = CREATE_NO_WINDOW
+    return subprocess.run([str(a) for a in args], **kw)
+
+
+def do_setup() -> int:
+    """Run once by the installer (as administrator): prepare everything so the program runs at every
+    boot with full permissions, then start it immediately - no restart needed."""
+    import ctypes
+    if not IS_WINDOWS:
+        print("Setup is for Windows only")
+        return 1
+    if not ctypes.windll.shell32.IsUserAnAdmin():
+        log.error("Setup needs administrator rights")
+        return 1
+    exe = Path(sys.executable).resolve() if FROZEN else Path(__file__).resolve()
+    tmp = DATA_DIR / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    # the helper processes that run as the logged-on user may write only into tmp
+    r = _run(["icacls", tmp, "/grant", "*S-1-5-32-545:(OI)(CI)M"])
+    log.info("Folder permissions: %s", "ok" if r.returncode == 0 else r.stdout.decode(errors="replace")[:200])
+
+    # 1. the startup task (SYSTEM, at boot) - full definition, falling back to simple tasks
+    xml_path = DATA_DIR / "task.xml"
+    xml_path.write_text(task_xml(exe), encoding="utf-16")
+    r = _run(["schtasks", "/Create", "/TN", TASK_NAME, "/XML", xml_path, "/F"])
+    if r.returncode == 0:
+        log.info("Startup task registered (boot + logon + every 5 minutes, SYSTEM)")
+    else:
+        log.warning("Full task definition refused (%s) - using simple tasks",
+                    (r.stderr or r.stdout).decode(errors="replace").strip()[:300])
+        quoted = f'"{exe}"'
+        r1 = _run(["schtasks", "/Create", "/TN", TASK_NAME, "/SC", "ONSTART", "/DELAY", "0000:15",
+                   "/RU", "SYSTEM", "/RL", "HIGHEST", "/TR", quoted, "/F"])
+        r2 = _run(["schtasks", "/Create", "/TN", TASK_NAME + " Watchdog", "/SC", "MINUTE", "/MO", "5",
+                   "/RU", "SYSTEM", "/RL", "HIGHEST", "/TR", quoted, "/F"])
+        if r1.returncode or r2.returncode:
+            log.error("Could not register the startup task")
+            return 2
+    xml_path.unlink(missing_ok=True)
+
+    # 2. keep the computer reachable: no sleep / hibernate on mains power, no USB power saving (USB printers)
+    for args in (["powercfg", "/change", "standby-timeout-ac", "0"],
+                 ["powercfg", "/change", "hibernate-timeout-ac", "0"],
+                 ["powercfg", "/setacvalueindex", "SCHEME_CURRENT", "2a737441-1930-4402-8d77-b2bebba308a3",
+                  "48e6b7a6-50f5-4782-a5d4-53bb8f07e226", "0"],
+                 ["powercfg", "/setactive", "SCHEME_CURRENT"]):
+        try:
+            _run(args, timeout=30)
+        except Exception as e:
+            log.warning("powercfg failed: %s", e)
+
+    # 3. start now, through the task (so it runs exactly as it will after a restart)
+    r = _run(["schtasks", "/Run", "/TN", TASK_NAME])
+    log.info("Started now: %s", "ok" if r.returncode == 0 else (r.stderr or r.stdout).decode(errors="replace").strip()[:200])
+    return 0
+
+
+def do_remove() -> int:
+    for name in (TASK_NAME, TASK_NAME + " Watchdog"):
+        try:
+            _run(["schtasks", "/End", "/TN", name], timeout=30)
+            _run(["schtasks", "/Delete", "/TN", name, "/F"], timeout=30)
+        except Exception:
+            pass
+    return 0
+
+
 # --------------------------------------------------------------------------- self test (used by the build)
 
 def selftest() -> int:
@@ -941,6 +1193,16 @@ def selftest() -> int:
 
     check("crypto", crypto_roundtrip)
     check("printer list", lambda: list_printers())
+    def data_dir_writable():
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        probe = DATA_DIR / "probe.tmp"
+        probe.write_text("x")
+        probe.unlink()
+        return str(DATA_DIR)
+
+    check("data folder", data_dir_writable)
+    check("running as SYSTEM", is_system_account)
+    check("task xml", lambda: len(task_xml(Path(sys.executable))))
     check("printer health", lambda: printer_health(""))
     check("website key", lambda: VerifyKey(load_config(), lambda k, d: d, lambda k, v: None).get()[:12] or "not reachable")
     check("Word installed", word_installed)
@@ -949,7 +1211,8 @@ def selftest() -> int:
         check("pywin32", lambda: __import__("win32com.client").__name__)
         check("SumatraPDF", lambda: Printer._find_sumatra("") or (_ for _ in ()).throw(RuntimeError("missing")))
     lines.append("SELFTEST " + ("PASSED" if ok else "FAILED"))
-    (BASE_DIR / "selftest.txt").write_text("\n".join(lines), encoding="utf-8")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "selftest.txt").write_text("\n".join(lines), encoding="utf-8")
     return 0 if ok else 1
 
 
@@ -959,10 +1222,32 @@ def main():
     ap = argparse.ArgumentParser(description="Print documents sent from the remote printing website.")
     ap.add_argument("--test-print", metavar="FILE")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--setup", action="store_true", help="installer: register the startup task and start now")
+    ap.add_argument("--remove", action="store_true", help="uninstaller: remove the startup task")
+    ap.add_argument("--screenshot", metavar="FILE", help="internal helper: save a screenshot")
+    ap.add_argument("--print-word", nargs=3, metavar=("FILE", "PRINTER", "ERRFILE"), help="internal helper")
     args = ap.parse_args()
 
     if args.selftest:
         sys.exit(selftest())
+    if args.screenshot:                      # helper, runs in the logged-on user's session
+        data = _grab_screen()
+        if data:
+            Path(args.screenshot).write_bytes(data)
+        sys.exit(0 if data else 2)
+    if args.print_word:                      # helper, runs in the logged-on user's session
+        cfg = load_config()
+        printer = Printer(cfg)
+        printer.printer_name = args.print_word[1]
+        try:
+            printer._print_word_direct(Path(args.print_word[0]))
+        except Exception as e:
+            Path(args.print_word[2]).write_text(str(e), encoding="utf-8")
+            sys.exit(3)
+        sys.exit(0)
+    if args.setup or args.remove:
+        setup_logging()
+        sys.exit(do_setup() if args.setup else do_remove())
 
     setup_logging()
     cfg = load_config()
@@ -982,7 +1267,7 @@ def main():
     pq = PrintQueue(printer, cfg.getboolean("general", "keep_files", fallback=False))
     agent = Agent(cfg, None, printer, pq)
     verify = VerifyKey(cfg, lambda k, d: agent.state.get(k, d), agent.state_put)
-    verify.refresh()
+    threading.Thread(target=verify.refresh, name="verify", daemon=True).start()   # never delay the start
     g = cfg["general"]          # test installations (CI) use their own channel - never the real one
     agent.ch = Channel(g.get("topic", "").strip() or os.environ.get("RP_TOPIC", "").strip() or CHANNEL_TOPIC,
                        g.get("key", "").strip() or os.environ.get("RP_KEY", "").strip() or CHANNEL_KEY, verify)
@@ -1002,6 +1287,7 @@ if __name__ == "__main__":
         raise
     except BaseException:   # no console in the installed program - leave a trace for support
         import traceback
-        (BASE_DIR / "crash.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        (DATA_DIR / "crash.txt").write_text(traceback.format_exc(), encoding="utf-8")
         log.exception("Crashed")
         raise
