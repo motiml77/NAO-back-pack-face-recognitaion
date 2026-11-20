@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 2970 2100" width="2970" height="2100">
+  <defs>
+    <!-- plaque outline: arched top and bottom centre, room for scrolls in the corners -->
+    <path id="plaque" d="
+      M 330,250
+      C 820,250 1150,248 1290,196 C 1380,160 1410,112 1485,112 C 1560,112 1590,160 1680,196 C 1820,248 2150,250 2640,250
+      C 2720,250 2780,310 2780,390
+      L 2780,1710
+      C 2780,1790 2720,1850 2640,1850
+      C 2150,1850 1820,1852 1680,1904 C 1590,1940 1560,1988 1485,1988 C 1410,1988 1380,1940 1290,1904 C 1150,1852 820,1850 330,1850
+      C 250,1850 190,1790 190,1710
+      L 190,390
+      C 190,310 250,250 330,250 Z"/>
+
+    <radialGradient id="inside" cx="50%" cy="50%" r="62%">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.55" stop-color="#fbfbfb"/>
+      <stop offset="0.78" stop-color="#d9d9d9"/>
+      <stop offset="0.92" stop-color="#9c9c9c"/>
+      <stop offset="1" stop-color="#5e5e5e"/>
+    </radialGradient>
+    <linearGradient id="metal" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3a3a3a"/>
+      <stop offset="0.18" stop-color="#bdbdbd"/>
+      <stop offset="0.35" stop-color="#4a4a4a"/>
+      <stop offset="0.5" stop-color="#d4d4d4"/>
+      <stop offset="0.66" stop-color="#4f4f4f"/>
+      <stop offset="0.82" stop-color="#c2c2c2"/>
+      <stop offset="1" stop-color="#363636"/>
+    </linearGradient>
+    <linearGradient id="metalV" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e6e6e6"/>
+      <stop offset="0.45" stop-color="#8a8a8a"/>
+      <stop offset="1" stop-color="#2e2e2e"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000" flood-opacity="0.45"/>
+    </filter>
+
+    <!-- one corner scroll (drawn for the top-left corner, mirrored for the others) -->
+    <g id="scroll">
+      <!-- acanthus leaf running along the top edge -->
+      <path d="M 300,250 C 360,170 470,150 560,190 C 500,190 440,205 400,240 C 470,215 540,220 600,262 C 520,250 440,262 380,300 Z"
+            fill="url(#metalV)" stroke="#262626" stroke-width="5"/>
+      <!-- leaf running down the side -->
+      <path d="M 190,330 C 120,390 105,500 145,585 C 145,525 160,465 195,425 C 170,495 175,565 215,625 C 205,545 215,465 250,405 Z"
+            fill="url(#metalV)" stroke="#262626" stroke-width="5"/>
+      <!-- the volute itself -->
+      <path d="M 330,250 C 330,170 260,120 195,140 C 130,160 105,235 140,290 C 170,335 235,340 265,300 C 290,265 275,215 235,205 C 200,197 175,225 185,255 C 192,276 218,282 230,266"
+            fill="none" stroke="#262626" stroke-width="30" stroke-linecap="round"/>
+      <path d="M 330,250 C 330,170 260,120 195,140 C 130,160 105,235 140,290 C 170,335 235,340 265,300 C 290,265 275,215 235,205 C 200,197 175,225 185,255 C 192,276 218,282 230,266"
+            fill="none" stroke="url(#metalV)" stroke-width="18" stroke-linecap="round"/>
+      <circle cx="212" cy="246" r="20" fill="url(#metalV)" stroke="#262626" stroke-width="5"/>
+      <!-- small curl tucked inside the corner -->
+      <path d="M 250,390 C 250,330 300,300 345,320 C 380,335 385,380 355,398 C 333,410 310,395 316,375"
+            fill="none" stroke="#2b2b2b" stroke-width="14" stroke-linecap="round"/>
+      <path d="M 250,390 C 250,330 300,300 345,320 C 380,335 385,380 355,398 C 333,410 310,395 316,375"
+            fill="none" stroke="#bdbdbd" stroke-width="6" stroke-linecap="round"/>
+    </g>
+
+    <!-- divider ornament under the heading -->
+    <g id="ornament">
+      <path d="M -40,0 C -110,-55 -200,-45 -235,0 C -200,45 -110,55 -40,0 Z" fill="#2b2b2b"/>
+      <path d="M 40,0 C 110,-55 200,-45 235,0 C 200,45 110,55 40,0 Z" fill="#2b2b2b"/>
+      <path d="M -235,0 C -280,-30 -330,-30 -360,0 C -330,22 -300,18 -285,0" fill="none" stroke="#2b2b2b" stroke-width="9" stroke-linecap="round"/>
+      <path d="M 235,0 C 280,-30 330,-30 360,0 C 330,22 300,18 285,0" fill="none" stroke="#2b2b2b" stroke-width="9" stroke-linecap="round"/>
+      <path d="M 0,-48 L 42,0 L 0,48 L -42,0 Z" fill="#2b2b2b"/>
+      <circle cx="0" cy="0" r="14" fill="#f2f2f2"/>
+      <path d="M -60,-3 C -110,-28 -170,-24 -205,0 M 60,-3 C 110,-28 170,-24 205,0" fill="none" stroke="#f2f2f2" stroke-width="5"/>
+      <circle cx="-400" cy="0" r="9" fill="#2b2b2b"/>
+      <circle cx="400" cy="0" r="9" fill="#2b2b2b"/>
+    </g>
+  </defs>
+
+  <rect width="2970" height="2100" fill="#ffffff"/>
+
+  <!-- plaque body -->
+  <g filter="url(#shadow)">
+    <use xlink:href="#plaque" href="#plaque" fill="url(#inside)"/>
+    <use xlink:href="#plaque" href="#plaque" fill="none" stroke="#1f1f1f" stroke-width="64"/>
+    <use xlink:href="#plaque" href="#plaque" fill="none" stroke="url(#metal)" stroke-width="44"/>
+  </g>
+  <!-- inner fine lines -->
+  <g transform="translate(1485 1050) scale(0.962 0.948) translate(-1485 -1050)">
+    <use xlink:href="#plaque" href="#plaque" fill="none" stroke="#3a3a3a" stroke-width="7"/>
+  </g>
+  <g transform="translate(1485 1050) scale(0.952 0.934) translate(-1485 -1050)">
+    <use xlink:href="#plaque" href="#plaque" fill="none" stroke="#efefef" stroke-width="4" opacity="0.9"/>
+  </g>
+
+  <!-- corner scrolls -->
+  <use xlink:href="#scroll" href="#scroll"/>
+  <use xlink:href="#scroll" href="#scroll" transform="translate(2970 0) scale(-1 1)"/>
+  <use xlink:href="#scroll" href="#scroll" transform="translate(0 2100) scale(1 -1)"/>
+  <use xlink:href="#scroll" href="#scroll" transform="translate(2970 2100) scale(-1 -1)"/>
+
+  <!-- top and bottom centre crests -->
+  <g transform="translate(1485 112)">
+    <path d="M -95,30 C -60,-30 -20,-46 0,-46 C 20,-46 60,-30 95,30 C 50,8 -50,8 -95,30 Z" fill="url(#metalV)" stroke="#262626" stroke-width="5"/>
+    <circle cx="0" cy="-12" r="16" fill="#2b2b2b"/>
+  </g>
+  <g transform="translate(1485 1988) scale(1 -1)">
+    <path d="M -95,30 C -60,-30 -20,-46 0,-46 C 20,-46 60,-30 95,30 C 50,8 -50,8 -95,30 Z" fill="url(#metalV)" stroke="#262626" stroke-width="5"/>
+    <circle cx="0" cy="-12" r="16" fill="#2b2b2b"/>
+  </g>
+
+  <!-- divider under the heading (heading text itself is drawn by the page) -->
+  <use xlink:href="#ornament" href="#ornament" transform="translate(1485 720)"/>
+</svg>
