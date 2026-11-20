@@ -31,6 +31,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller==6.11.1
 
+      - name: Guard - the program must never be able to show a window
+        run: python tools\check_silent.py
+
       - name: Get SumatraPDF (bundled inside the installer)
         run: |
           $page = (Invoke-WebRequest "https://www.sumatrapdfreader.org/download-free-pdf-viewer" -UseBasicParsing).Content
@@ -71,6 +74,31 @@ jobs:
           function Show-Log { Get-Content "$data\remote_printer.log" -ErrorAction SilentlyContinue | Select-Object -Last 80 }
           function Get-RpProcess { Get-CimInstance Win32_Process -Filter "Name='RemotePrinter.exe'" | Select-Object -First 1 }
           function Get-RpOwner { $o = Invoke-CimMethod -InputObject (Get-RpProcess) -MethodName GetOwner; "$($o.Domain)\$($o.User)" }
+          function Show-PrintDiagnostics {
+            Write-Host "=== PRINT DIAGNOSTICS ==="
+            Show-Log
+            Get-Printer -Name "Pantum CI Test" | Format-List Name, DriverName, PortName, PrinterStatus
+            Get-PrintJob -PrinterName "Pantum CI Test" | Format-List Id, DocumentName, JobStatus, UserName
+            $pdf = (Resolve-Path tools\test_page.pdf).Path
+            Get-PrintJob -PrinterName "Pantum CI Test" | Remove-PrintJob -ErrorAction SilentlyContinue
+            Remove-Item C:\ci\printed.pdf -ErrorAction SilentlyContinue
+            Write-Host "--- the same print, as the runner's own user"
+            & "$app\SumatraPDF.exe" -print-to "Pantum CI Test" -silent $pdf
+            Start-Sleep 20
+            Get-PrintJob -PrinterName "Pantum CI Test" | Format-List Id, DocumentName, JobStatus, UserName
+            Write-Host ("output file exists: " + (Test-Path C:\ci\printed.pdf))
+            Get-PrintJob -PrinterName "Pantum CI Test" | Remove-PrintJob -ErrorAction SilentlyContinue
+            Remove-Item C:\ci\printed.pdf -ErrorAction SilentlyContinue
+            Write-Host "--- the same print, as SYSTEM through a one-off task"
+            $act = New-ScheduledTaskAction -Execute "$app\SumatraPDF.exe" -Argument "-print-to `"Pantum CI Test`" -silent `"$pdf`""
+            Register-ScheduledTask -TaskName RpDiag -Action $act -User SYSTEM -RunLevel Highest -Force | Out-Null
+            Start-ScheduledTask -TaskName RpDiag
+            Start-Sleep 20
+            Get-PrintJob -PrinterName "Pantum CI Test" | Format-List Id, DocumentName, JobStatus, UserName
+            Write-Host ("output file exists: " + (Test-Path C:\ci\printed.pdf))
+            Unregister-ScheduledTask -TaskName RpDiag -Confirm:$false
+            Get-PrintJob -PrinterName "Pantum CI Test" | Remove-PrintJob -ErrorAction SilentlyContinue
+          }
           function Wait-RpProcess { for ($i = 0; $i -lt 40 -and -not (Get-RpProcess); $i++) { Start-Sleep 1 }; if (-not (Get-RpProcess)) { Show-Log; throw "the program is not running" } }
 
           # 0. a throw-away test channel in the settings file BEFORE installing (this machine must never
@@ -119,7 +147,7 @@ jobs:
 
           # 6. REAL silent print through the Windows spooler, as SYSTEM, confirmed by the program
           python tools\send_test.py --password $pw --topic $topic --key $key print tools\test_page.pdf
-          if ($LASTEXITCODE -ne 0) { Show-Log; throw "real print failed" }
+          if ($LASTEXITCODE -ne 0) { Show-PrintDiagnostics; throw "real print failed" }
           Start-Sleep 2
           $out = Get-Item C:\ci\printed.pdf -ErrorAction SilentlyContinue
           if (-not $out -or $out.Length -lt 1000) { Show-Log; throw "printer output missing" }
@@ -147,6 +175,13 @@ jobs:
           & "$app\RemotePrinter.exe" --screenshot C:\ci\direct.jpg
           Start-Sleep 3
           if (Test-Path C:\ci\direct.jpg) { Write-Host "Direct screenshot: $((Get-Item C:\ci\direct.jpg).Length) bytes" } else { Write-Host "::warning::direct screenshot not available on the build machine" }
+
+          # 6e. the Word helper without Word: must fail quietly with a message (exit code 3)
+          $h = Start-Process "$app\RemotePrinter.exe" -ArgumentList "--word-to-pdf", "C:\ci\none.docx", "C:\ci\none.pdf", "C:\ci\none.err" -PassThru
+          $null = $h.Handle
+          if (-not $h.WaitForExit(60000)) { $h.Kill(); throw "the Word helper hung" }
+          Write-Host "Word helper exit code: $($h.ExitCode); message: $(Get-Content C:\ci\none.err -ErrorAction SilentlyContinue)"
+          if ($h.ExitCode -ne 3) { throw "the Word helper should exit with 3 when Word is missing" }
 
           # 7. unsupported file -> a clean error reply
           python tools\send_test.py --password $pw --topic $topic --key $key --expect-error print ..\docs\fonts\StamAshkenazCLM-LICENSE.txt

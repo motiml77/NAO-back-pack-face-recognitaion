@@ -27,6 +27,7 @@ def http(url, data=None, method=None):
 
 
 def main():
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")      # Hebrew replies on a cp1252 console
     ap = argparse.ArgumentParser()
     ap.add_argument("--password", required=True)
     ap.add_argument("--timeout", type=int, default=120)

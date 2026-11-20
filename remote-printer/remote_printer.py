@@ -64,7 +64,7 @@ except Exception as _e:   # pragma: no cover
     InvalidSignature = Exception
     CRYPTO_ERROR = repr(_e)
 
-VERSION = "3.2"
+VERSION = "3.3"
 FROZEN = getattr(sys, "frozen", False)
 IS_WINDOWS = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
@@ -101,6 +101,17 @@ SUPPORTED_EXT = PDF_EXT | WORD_EXT
 PRINT_TIMEOUT_SEC = 180
 SINGLE_INSTANCE_PORT = 47631
 CREATE_NO_WINDOW = 0x08000000
+
+
+def quiet_kwargs():
+    """subprocess arguments that start a program with no window of any kind (console or GUI).
+    EVERY subprocess call in this program must use them - tools/check_silent.py enforces it."""
+    if not IS_WINDOWS:
+        return {}
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = subprocess.SW_HIDE
+    return {"creationflags": CREATE_NO_WINDOW, "startupinfo": si}
 USER_AGENT = f"RemotePrinter/{VERSION}"
 
 log = logging.getLogger("remote_printer")
@@ -162,9 +173,7 @@ def unique_path(folder: Path, filename: str) -> Path:
 
 
 def run_quiet(args, timeout=PRINT_TIMEOUT_SEC):
-    kwargs = {"capture_output": True, "timeout": timeout}
-    if IS_WINDOWS:
-        kwargs["creationflags"] = CREATE_NO_WINDOW
+    kwargs = {"capture_output": True, "timeout": timeout, **quiet_kwargs()}
     try:
         res = subprocess.run([str(a) for a in args], **kwargs)
     except subprocess.TimeoutExpired:
@@ -205,9 +214,9 @@ def list_printers():
             return [], ""
     names, default = [], ""
     try:
-        out = subprocess.run(["lpstat", "-e"], capture_output=True, text=True, timeout=10).stdout
+        out = subprocess.run(["lpstat", "-e"], capture_output=True, text=True, timeout=10, **quiet_kwargs()).stdout
         names = sorted(n.strip() for n in out.splitlines() if n.strip())
-        out = subprocess.run(["lpstat", "-d"], capture_output=True, text=True, timeout=10).stdout
+        out = subprocess.run(["lpstat", "-d"], capture_output=True, text=True, timeout=10, **quiet_kwargs()).stdout
         default = out.split(":", 1)[1].strip() if ":" in out else ""
     except Exception:
         pass
@@ -308,7 +317,7 @@ def printer_health(configured: str) -> dict:
             info["problems"].append(f"לא ניתן לבדוק את המדפסת ({e})")
     else:
         try:
-            out = subprocess.run(["lpstat", "-p", name], capture_output=True, text=True, timeout=10).stdout
+            out = subprocess.run(["lpstat", "-p", name], capture_output=True, text=True, timeout=10, **quiet_kwargs()).stdout
             if "disabled" in out:
                 info["problems"].append("המדפסת מושבתת")
         except Exception:
@@ -462,6 +471,7 @@ def wait_for_printer(name: str, before: dict, timeout=300):
     if not ours:     # very fast printers / drivers that hide finished jobs
         return True, "המדפסת קיבלה את הדף"
     problem_since = None
+    logged = False
     while time.time() - t0 < timeout:
         jobs = spool_jobs(name)
         left = {j: st for j, st in jobs.items() if j in ours and not st & JOB_DONE}
@@ -471,6 +481,10 @@ def wait_for_printer(name: str, before: dict, timeout=300):
         flags = printer_flags(name)              # many printers report paper-out etc. only here
         problems += [t for f, t in PRINTER_PROBLEMS if flags & f]
         if problems:
+            if not logged:
+                logged = True
+                log.warning("Print problem %s | job status %s | printer status 0x%x",
+                            problems, {j: hex(st) for j, st in left.items()}, flags)
             problem_since = problem_since or time.time()
             if time.time() - problem_since > 20:
                 return False, problems[0] + " (הדף ממתין בתור ויודפס כשהבעיה תסודר)"
@@ -481,6 +495,76 @@ def wait_for_printer(name: str, before: dict, timeout=300):
 
 
 # --------------------------------------------------------------------------- printing
+
+def _word_pid(word):
+    try:
+        import win32gui
+        import win32process
+        marker = f"RemotePrinter-{os.getpid()}-{time.time()}"
+        word.Caption = marker
+        hwnd = win32gui.FindWindow("OpusApp", marker)
+        if hwnd:
+            return win32process.GetWindowThreadProcessId(hwnd)[1]
+    except Exception:
+        pass
+    return None
+
+
+def word_export_pdf(src: Path, dst: Path):
+    """Hidden Microsoft Word opens the file and saves it as PDF. Word prints nothing and shows nothing.
+    Needs a logged-on user's session (see run_in_user_session)."""
+    import pythoncom
+    import win32com.client
+
+    pythoncom.CoInitialize()
+    word = doc = watchdog = None
+    killed = threading.Event()
+    try:
+        try:
+            word = win32com.client.DispatchEx("Word.Application")      # separate, invisible instance
+        except Exception as e:
+            raise PrintError("Microsoft Word לא מותקן במחשב או שהוא לא נפתח") from e
+        word.Visible = False
+        word.DisplayAlerts = 0                                         # wdAlertsNone
+        for attr, value in (("AutomationSecurity", 3),                 # never run macros
+                            ("ScreenUpdating", False)):
+            try:
+                setattr(word, attr, value)
+            except Exception:
+                pass
+        pid = _word_pid(word)
+        if pid:      # if Word gets stuck on a hidden dialog, kill it so the queue keeps working
+            def _kill():
+                killed.set()
+                log.error("Word is stuck - killing process %s", pid)
+                subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"], capture_output=True, **quiet_kwargs())
+            watchdog = threading.Timer(PRINT_TIMEOUT_SEC - 20, _kill)
+            watchdog.daemon = True
+            watchdog.start()
+        doc = word.Documents.Open(
+            FileName=str(src), ConfirmConversions=False, ReadOnly=True,
+            AddToRecentFiles=False, Visible=False,
+            PasswordDocument="__no_password__",       # password-protected files fail instead of asking
+            NoEncodingDialog=True)
+        try:
+            doc.ExportAsFixedFormat(OutputFileName=str(dst), ExportFormat=17, OpenAfterExport=False, OptimizeFor=0)
+        except Exception:
+            doc.SaveAs2(FileName=str(dst), FileFormat=17)             # wdFormatPDF
+    except Exception as e:
+        if killed.is_set():
+            raise PrintError("Word לא הגיב בזמן") from e
+        raise
+    finally:
+        if watchdog:
+            watchdog.cancel()
+        if not killed.is_set():
+            for action in (lambda: doc and doc.Close(SaveChanges=0), lambda: word and word.Quit(SaveChanges=0)):
+                try:
+                    action()
+                except Exception:
+                    pass
+        pythoncom.CoUninitialize()
+
 
 class Printer:
     def __init__(self, cfg: configparser.ConfigParser):
@@ -552,8 +636,7 @@ class Printer:
                 target = ["-print-to", self.printer_name] if self.printer_name else ["-print-to-default"]
                 run_quiet([self.sumatra, *target, "-print-settings", "fit", "-silent", path])
                 return
-            log.warning("SumatraPDF not found - falling back to the default PDF program")
-            self._shell_print(path)
+            raise PrintError("רכיב ההדפסה (SumatraPDF) חסר - הריצו שוב את ההתקנה")
         else:
             self._lp(path)
 
@@ -565,58 +648,44 @@ class Printer:
         else:
             raise PrintError("Neither 'lp' nor 'lpr' found - is CUPS installed?")
 
-    @staticmethod
-    def _shell_print(path: Path):
-        try:
-            os.startfile(str(path), "print")  # type: ignore[attr-defined]
-        except OSError as e:
-            raise PrintError(f"Windows could not print this file type ({e})")
-        time.sleep(15)  # give the external program time to spool before the next job
-
-    # ---- Word
+    # ---- Word: Word (hidden) saves it as PDF, then it is printed silently like any PDF
     def _print_word(self, path: Path):
-        if is_system_account():       # Word cannot run in the SYSTEM session - use the logged-on user's
-            err = DATA_DIR / "tmp" / f"word-{os.getpid()}.err"
-            try:
-                err.parent.mkdir(parents=True, exist_ok=True)
-                rc = run_in_user_session(["--print-word", path, self.printer_name, err], timeout=PRINT_TIMEOUT_SEC + 30)
-                if rc != 0:
-                    raise PrintError(err.read_text(encoding="utf-8").strip() if err.exists()
-                                     else f"הדפסת Word נכשלה (קוד {rc})")
-            finally:
-                try:
-                    err.unlink()
-                except OSError:
-                    pass
-            return
-        self._print_word_direct(path)
-
-    def _print_word_direct(self, path: Path):
-        if IS_WINDOWS:
-            try:
-                import win32com.client  # noqa: F401  (pywin32)
-                have_pywin32 = True
-            except ImportError:
-                have_pywin32 = False
-            if have_pywin32:
-                try:
-                    self._print_word_com(path)
-                    return
-                except PrintError:
-                    raise
-                except Exception as e:
-                    if not self.soffice:
-                        raise PrintError(f"Microsoft Word could not print the file: {e}")
-                    log.warning("Word automation failed (%s) - trying LibreOffice", e)
-            if self.soffice:
-                self._print_via_pdf(path)
-                return
-            log.warning("pywin32/LibreOffice not available - falling back to Windows 'print' verb")
-            self._shell_print(path)
-        else:
+        if not IS_WINDOWS:
             if not self.soffice:
                 raise PrintError("LibreOffice is required to print Word files on this system")
             self._print_via_pdf(path)
+            return
+        base = DATA_DIR / "tmp"
+        base.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="word-", dir=base, ignore_cleanup_errors=True) as tmp:
+            pdf = Path(tmp) / (path.stem + ".pdf")
+            try:
+                self._word_convert(path, pdf)
+            except PrintError as e:
+                if not self.soffice:
+                    raise
+                log.warning("Word could not convert the file (%s) - trying LibreOffice", e)
+                self._print_via_pdf(path)
+                return
+            self._print_pdf(pdf)
+
+    @staticmethod
+    def _word_convert(path: Path, pdf: Path):
+        if is_system_account():       # Word cannot run in the SYSTEM session - a helper does it in the user's
+            err = pdf.with_suffix(".err")
+            rc = run_in_user_session(["--word-to-pdf", path, pdf, err], timeout=PRINT_TIMEOUT_SEC)
+            if rc != 0 or not pdf.exists():
+                msg = err.read_text(encoding="utf-8").strip() if err.exists() else ""
+                raise PrintError(msg or f"המרת קובץ Word נכשלה (קוד {rc})")
+            return
+        try:
+            word_export_pdf(path, pdf)
+        except PrintError:
+            raise
+        except Exception as e:
+            raise PrintError(f"Microsoft Word לא הצליח לפתוח את הקובץ: {e}")
+        if not pdf.exists():
+            raise PrintError("Word לא הצליח להכין את הקובץ להדפסה")
 
     def _print_via_pdf(self, path: Path):
         """Convert with LibreOffice (headless, isolated profile) and print the PDF."""
@@ -628,77 +697,6 @@ class Printer:
             if not pdf.exists():
                 raise PrintError("LibreOffice did not produce a PDF")
             self._print_pdf(pdf)
-
-    def _print_word_com(self, path: Path):
-        import pythoncom
-        import win32com.client
-
-        pythoncom.CoInitialize()
-        word = doc = watchdog = None
-        old_printer = None
-        killed = threading.Event()
-        try:
-            word = win32com.client.DispatchEx("Word.Application")  # separate, invisible instance
-            word.Visible = False
-            word.DisplayAlerts = 0                     # wdAlertsNone
-            try:
-                word.AutomationSecurity = 3            # msoAutomationSecurityForceDisable: never run macros
-            except Exception:
-                pass
-
-            pid = self._word_pid(word)
-            if pid:  # if Word gets stuck on a hidden dialog, kill it so the queue keeps working
-                def _kill():
-                    killed.set()
-                    log.error("Word is stuck - killing process %s", pid)
-                    subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"],
-                                   capture_output=True, creationflags=CREATE_NO_WINDOW)
-                watchdog = threading.Timer(PRINT_TIMEOUT_SEC, _kill)
-                watchdog.daemon = True
-                watchdog.start()
-
-            if self.printer_name:
-                old_printer = word.ActivePrinter
-                word.ActivePrinter = self.printer_name
-
-            doc = word.Documents.Open(
-                FileName=str(path), ConfirmConversions=False, ReadOnly=True,
-                AddToRecentFiles=False, Visible=False,
-                PasswordDocument="__no_password__",   # password-protected files fail instead of prompting
-                NoEncodingDialog=True)
-            doc.PrintOut(Background=False)           # wait until the job is spooled
-        except Exception as e:
-            if killed.is_set():
-                raise PrintError(f"Word did not finish within {PRINT_TIMEOUT_SEC} seconds") from e
-            raise
-        finally:
-            if watchdog:
-                watchdog.cancel()
-            if not killed.is_set():
-                for action in (
-                    lambda: doc and doc.Close(SaveChanges=0),
-                    lambda: old_printer and setattr(word, "ActivePrinter", old_printer),
-                    lambda: word and word.Quit(SaveChanges=0),
-                ):
-                    try:
-                        action()
-                    except Exception:
-                        pass
-            pythoncom.CoUninitialize()
-
-    @staticmethod
-    def _word_pid(word):
-        try:
-            import win32gui
-            import win32process
-            marker = f"RemotePrinter-{os.getpid()}-{time.time()}"
-            word.Caption = marker
-            hwnd = win32gui.FindWindow("OpusApp", marker)
-            if hwnd:
-                return win32process.GetWindowThreadProcessId(hwnd)[1]
-        except Exception:
-            pass
-        return None
 
 
 class PrintQueue:
@@ -1102,8 +1100,7 @@ def task_xml(exe: Path) -> str:
 def _run(args, **kw):
     kw.setdefault("capture_output", True)
     kw.setdefault("timeout", 120)
-    if IS_WINDOWS:
-        kw["creationflags"] = CREATE_NO_WINDOW
+    kw = {**quiet_kwargs(), **kw}
     return subprocess.run([str(a) for a in args], **kw)
 
 
@@ -1225,8 +1222,15 @@ def main():
     ap.add_argument("--setup", action="store_true", help="installer: register the startup task and start now")
     ap.add_argument("--remove", action="store_true", help="uninstaller: remove the startup task")
     ap.add_argument("--screenshot", metavar="FILE", help="internal helper: save a screenshot")
-    ap.add_argument("--print-word", nargs=3, metavar=("FILE", "PRINTER", "ERRFILE"), help="internal helper")
+    ap.add_argument("--word-to-pdf", nargs=3, metavar=("SRC", "DST", "ERRFILE"), help="internal helper")
     args = ap.parse_args()
+
+    if IS_WINDOWS:   # no crash, missing-disk or file-error dialog can ever appear (inherited by child programs)
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
+        except Exception:
+            pass
 
     if args.selftest:
         sys.exit(selftest())
@@ -1235,14 +1239,11 @@ def main():
         if data:
             Path(args.screenshot).write_bytes(data)
         sys.exit(0 if data else 2)
-    if args.print_word:                      # helper, runs in the logged-on user's session
-        cfg = load_config()
-        printer = Printer(cfg)
-        printer.printer_name = args.print_word[1]
+    if args.word_to_pdf:                     # helper, runs in the logged-on user's session
         try:
-            printer._print_word_direct(Path(args.print_word[0]))
-        except Exception as e:
-            Path(args.print_word[2]).write_text(str(e), encoding="utf-8")
+            word_export_pdf(Path(args.word_to_pdf[0]), Path(args.word_to_pdf[1]))
+        except BaseException as e:
+            Path(args.word_to_pdf[2]).write_text(str(e), encoding="utf-8")
             sys.exit(3)
         sys.exit(0)
     if args.setup or args.remove:
@@ -1290,4 +1291,4 @@ if __name__ == "__main__":
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         (DATA_DIR / "crash.txt").write_text(traceback.format_exc(), encoding="utf-8")
         log.exception("Crashed")
-        raise
+        sys.exit(1)     # never re-raise: the windowed launcher would pop up "Failed to execute script"
