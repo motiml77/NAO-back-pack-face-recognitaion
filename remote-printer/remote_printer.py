@@ -64,7 +64,7 @@ except Exception as _e:   # pragma: no cover
     InvalidSignature = Exception
     CRYPTO_ERROR = repr(_e)
 
-VERSION = "3.3"
+VERSION = "3.4"
 FROZEN = getattr(sys, "frozen", False)
 IS_WINDOWS = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
@@ -75,6 +75,7 @@ CONFIG_PATH = DATA_DIR / "config.ini"
 STATE_PATH = DATA_DIR / "state.json"
 TASK_NAME = "RemotePrinter"
 NO_USER = "אף משתמש לא מחובר ל-Windows במחשב, ולכן אי אפשר להפעיל את זה כרגע"
+FALLBACK_NOTE = "אף משתמש לא מחובר ל-Windows, וייתכן שמנהל ההתקן של המדפסת דורש משתמש מחובר"
 
 RELAY = "https://ntfy.sh"
 SITE_URL = "https://motiml77.github.io/NAO-back-pack-face-recognitaion/"
@@ -119,6 +120,10 @@ log = logging.getLogger("remote_printer")
 
 class PrintError(Exception):
     pass
+
+
+class NoUserSession(PrintError):
+    """Nobody is logged on to Windows, so nothing can run in a user's session."""
 
 
 # --------------------------------------------------------------------------- helpers
@@ -356,10 +361,11 @@ def is_system_account() -> bool:
         return False
 
 
-def run_in_user_session(args, timeout=60) -> int:
-    """Run this program with `args` hidden inside the logged-on user's desktop session
-    (needed for screenshots and Microsoft Word, which do not work from the SYSTEM session).
-    Returns the exit code. Raises PrintError if nobody is logged on."""
+def run_in_user_session(args, timeout=60, program=None) -> int:
+    """Run `program` (default: this program) with `args`, hidden, inside the logged-on user's desktop
+    session. Needed for screenshots, Microsoft Word and printer drivers that only print for a real
+    user - none of them work from the SYSTEM session. Returns the exit code.
+    Raises NoUserSession if nobody is logged on."""
     import pywintypes
     import win32api
     import win32event
@@ -369,18 +375,18 @@ def run_in_user_session(args, timeout=60) -> int:
 
     sid = win32ts.WTSGetActiveConsoleSessionId()
     if sid in (0xFFFFFFFF, -1):
-        raise PrintError(NO_USER)
+        raise NoUserSession(NO_USER)
     try:
         token = win32ts.WTSQueryUserToken(sid)
     except pywintypes.error:
-        raise PrintError(NO_USER)
+        raise NoUserSession(NO_USER)
     try:
         env = win32profile.CreateEnvironmentBlock(token, False)
         si = win32process.STARTUPINFO()
         si.lpDesktop = "winsta0\\default"
         si.dwFlags = win32process.STARTF_USESHOWWINDOW
         si.wShowWindow = 0   # SW_HIDE
-        prefix = [sys.executable] if FROZEN else [sys.executable, str(Path(__file__).resolve())]
+        prefix = [str(program)] if program else ([sys.executable] if FROZEN else [sys.executable, str(Path(__file__).resolve())])
         cmdline = subprocess.list2cmdline(prefix + [str(a) for a in args])
         h_proc, h_thread, _, _ = win32process.CreateProcessAsUser(
             token, None, cmdline, None, None, False, 0x08000000 | 0x00000400,   # NO_WINDOW | UNICODE_ENV
@@ -458,6 +464,24 @@ def spool_jobs(name: str) -> dict:
         return {}
 
 
+def delete_spool_jobs(name: str, ids):
+    """Remove jobs from the Windows print queue (used for jobs stuck in ERROR - they never print
+    and would block everything behind them)."""
+    try:
+        import win32print
+        h = win32print.OpenPrinter(name)
+        try:
+            for job_id in ids:
+                try:
+                    win32print.SetJob(h, job_id, 0, None, win32print.JOB_CONTROL_DELETE)
+                except Exception as e:
+                    log.warning("Could not remove job %s: %s", job_id, e)
+        finally:
+            win32print.ClosePrinter(h)
+    except Exception as e:
+        log.warning("Could not clean the print queue: %s", e)
+
+
 def wait_for_printer(name: str, before: dict, timeout=300):
     """Follow our job in the Windows queue until the printer has finished it.
     Returns (ok, message)."""
@@ -487,6 +511,10 @@ def wait_for_printer(name: str, before: dict, timeout=300):
                             problems, {j: hex(st) for j, st in left.items()}, flags)
             problem_since = problem_since or time.time()
             if time.time() - problem_since > 20:
+                dead = [j for j, st in left.items() if st & 0x2]    # JOB_STATUS_ERROR: will never print
+                if dead:
+                    delete_spool_jobs(name, dead)
+                    return False, problems[0] + " (העבודה בוטלה כדי לא לחסום את התור)"
                 return False, problems[0] + " (הדף ממתין בתור ויודפס כשהבעיה תסודר)"
         else:
             problem_since = None
@@ -569,6 +597,7 @@ def word_export_pdf(src: Path, dst: Path):
 class Printer:
     def __init__(self, cfg: configparser.ConfigParser):
         g = "general"
+        self.fallback_note = ""     # set when a job had to be printed as SYSTEM because nobody is logged on
         self.configured = cfg.get(g, "printer_name", fallback="").strip()   # chosen on the website ("" = auto)
         self.printer_name = resolve_printer(self.configured)[0]
         self.dry_run = cfg.getboolean(g, "dry_run", fallback=False)
@@ -632,11 +661,22 @@ class Printer:
     # ---- PDF
     def _print_pdf(self, path: Path):
         if IS_WINDOWS:
-            if self.sumatra:
-                target = ["-print-to", self.printer_name] if self.printer_name else ["-print-to-default"]
-                run_quiet([self.sumatra, *target, "-print-settings", "fit", "-silent", path])
-                return
-            raise PrintError("רכיב ההדפסה (SumatraPDF) חסר - הריצו שוב את ההתקנה")
+            if not self.sumatra:
+                raise PrintError("רכיב ההדפסה (SumatraPDF) חסר - הריצו שוב את ההתקנה")
+            target = ["-print-to", self.printer_name] if self.printer_name else ["-print-to-default"]
+            args = [*target, "-print-settings", "fit", "-silent", path]
+            if is_system_account():
+                # Many printer drivers only print for a real user (a job owned by SYSTEM ends in an error),
+                # so print as the logged-on user - hidden. Nobody logged on: print as SYSTEM.
+                try:
+                    rc = run_in_user_session(args, timeout=PRINT_TIMEOUT_SEC, program=self.sumatra)
+                    if rc != 0:
+                        raise PrintError(f"רכיב ההדפסה נכשל (קוד {rc})")
+                    return
+                except NoUserSession:
+                    self.fallback_note = FALLBACK_NOTE
+                    log.info("Nobody is logged on - printing as SYSTEM")
+            run_quiet([self.sumatra, *args])
         else:
             self._lp(path)
 
@@ -725,9 +765,12 @@ class PrintQueue:
                 if not target and not self.printer.dry_run:
                     raise PrintError("לא נמצאה מדפסת - בדקו שהמדפסת מחוברת ודלוקה")
                 before = {} if self.printer.dry_run else spool_jobs(target)
+                self.printer.fallback_note = ""
                 self.printer.print_file(path)
                 if not self.printer.dry_run:
                     ok, err = wait_for_printer(target, before)
+                    if not ok and self.printer.fallback_note:
+                        err = f"{err}. {self.printer.fallback_note}"
                 else:
                     err = "מצב בדיקה - לא הודפס באמת"
                 log.info("Printed %s (from %s): %s", path.name, source, err)
