@@ -232,8 +232,33 @@ jobs:
           name: RemotePrinter-Setup
           path: remote-printer/dist/RemotePrinter-Setup.exe
 
-      - name: Publish as a GitHub release
+      - name: Publish the installer on the 'installer' branch (always the newest build; the download link points here)
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $pub = Join-Path $env:RUNNER_TEMP "installer-publish"
+          Remove-Item $pub -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory $pub | Out-Null
+          Copy-Item dist\RemotePrinter-Setup.exe $pub
+          $hash = (Get-FileHash dist\RemotePrinter-Setup.exe -Algorithm SHA256).Hash.ToLower()
+          Set-Content "$pub\SHA256.txt" "$hash  RemotePrinter-Setup.exe"
+          Set-Content "$pub\VERSION.txt" "3.7.${{ github.run_number }}  commit ${{ github.sha }}"
+          Push-Location $pub
+          git init -q -b installer
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Installer 3.7.${{ github.run_number }} (${{ github.sha }})"
+          git push -f "https://x-access-token:$env:GH_TOKEN@github.com/${{ github.repository }}.git" installer
+          $rc = $LASTEXITCODE
+          Pop-Location
+          if ($rc -ne 0) { throw "could not publish the installer branch" }
+          Write-Host "Installer published: https://github.com/${{ github.repository }}/raw/installer/RemotePrinter-Setup.exe (sha256 $hash)"
+
+      - name: Publish as a GitHub release (optional - GitHub answers 403 for this at the moment)
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        continue-on-error: true
         uses: softprops/action-gh-release@v2
         with:
           tag_name: remote-printer-3.7.${{ github.run_number }}
