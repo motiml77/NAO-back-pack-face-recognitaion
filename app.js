@@ -1,6 +1,6 @@
-import { login, resume, WrongPassword } from "./link.js?v=2624ed1";
+import { login, resume, WrongPassword } from "./link.js?v=427f45e";
 import { loadAssets, drawPage, cleanLines, canvasToPdf, PRESETS, MAX_TITLE_LINES,
-         isImageFile, decodeImage, imagePageSizes, drawImagePage } from "./render.js?v=2624ed1";
+         isImageFile, decodeImage, imagePageSizes, drawImagePage } from "./render.js?v=427f45e";
 
 const $ = (id) => document.getElementById(id);
 const SAVED_KEY = "rp-link";
