@@ -337,3 +337,4 @@ jobs:
           Write-Host "Printed while locked: $($out.Length) bytes"
           python tools\send_test.py --password $pw --topic $topic --key $key --timeout 45 shot
           Write-Host "(screenshot while locked: exit code $LASTEXITCODE - a locked screen cannot be captured, the program must answer with a reason)"
+          exit 0

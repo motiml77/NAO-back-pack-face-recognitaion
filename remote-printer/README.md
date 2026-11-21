@@ -4,7 +4,7 @@
 המחשב שמחובר למדפסת מדפיס **מיד**, בלי חלונות ובלי שמישהו ילחץ על משהו.
 
 - **אתר ההדפסה:** https://motiml77.github.io/NAO-back-pack-face-recognitaion/
-- **תוכנת ההתקנה למחשב של המדפסת:** [RemotePrinter-Setup.exe](https://github.com/motiml77/NAO-back-pack-face-recognitaion/releases/latest/download/RemotePrinter-Setup.exe)
+- **תוכנת ההתקנה למחשב של המדפסת (תמיד הגרסה האחרונה):** [RemotePrinter-Setup.exe](https://github.com/motiml77/NAO-back-pack-face-recognitaion/raw/installer/RemotePrinter-Setup.exe)
 
 ## הדף נשלח כ-PDF, ולמה זה בטוח להדפסה
 האתר מכין דף PDF אחד בגודל A4 לרוחב, ובתוכו כל הדף כתמונה ברזולוציה של 300dpi.
