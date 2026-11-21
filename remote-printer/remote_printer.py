@@ -59,13 +59,16 @@ CRYPTO_ERROR = ""
 try:   # top-level imports so the packager bundles them
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.exceptions import InvalidSignature
 except Exception as _e:   # pragma: no cover
-    AESGCM = Ed25519PublicKey = None
+    AESGCM = Ed25519PublicKey = X25519PrivateKey = X25519PublicKey = HKDF = hashes = serialization = None
     InvalidSignature = Exception
     CRYPTO_ERROR = repr(_e)
 
-VERSION = "3.6"
+VERSION = "3.7"
 FROZEN = getattr(sys, "frozen", False)
 IS_WINDOWS = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
@@ -104,10 +107,6 @@ PRINT_TIMEOUT_SEC = 180
 SINGLE_INSTANCE_PORT = 47631
 CREATE_NO_WINDOW = 0x08000000
 
-
-# Screenshots are switched off until the replies from this computer are encrypted so that only the
-# holder of the website password can read them (today the channel key is public).
-SCREENSHOTS_ENABLED = False
 
 _OPENER = None
 
@@ -486,9 +485,6 @@ def _grab_screen():
 def take_screenshot():
     """JPEG of the whole screen (all monitors), or None. Used to show the problem on the website."""
     SHOT_ERROR["text"] = ""
-    if not SCREENSHOTS_ENABLED:
-        SHOT_ERROR["text"] = "צילום מסך כבוי זמנית, עד שתתווסף הצפנה מלאה לתמונות"
-        return None
     if is_system_account():       # the screen belongs to the logged-on user - ask a helper in that session
         out = DATA_DIR / "tmp" / f"shot-{os.getpid()}-{int(time.time())}.jpg"
         try:
@@ -921,6 +917,43 @@ class PrintQueue:
 
 # --------------------------------------------------------------------------- secure channel
 
+# Replies (status, printer state, SCREENSHOTS) are encrypted to the device that sent the command.
+# Every command carries the device's X25519 public key "rk" INSIDE the signed part, so nobody can swap
+# it for their own. The channel key itself is public (channel.json) and protects nothing.
+#   reply = e_pub(32) | iv(12) | AES-256-GCM(key, iv, data, aad = e_pub | rk)
+#   key   = HKDF-SHA256(X25519(e_priv, rk), salt = e_pub | rk, info = "remote-printer/reply/v1")
+REPLY_INFO = b"remote-printer/reply/v1"
+
+
+def parse_rk(value):
+    """The device's reply key from a signed command: 32 raw bytes, or None."""
+    try:
+        raw = base64.b64decode(value or "", validate=True)
+        return raw if len(raw) == 32 else None
+    except Exception:
+        return None
+
+
+def _reply_key(shared: bytes, e_pub: bytes, rk: bytes) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=e_pub + rk, info=REPLY_INFO).derive(shared)
+
+
+def encrypt_reply(rk: bytes, data: bytes) -> bytes:
+    eph = X25519PrivateKey.generate()
+    e_pub = eph.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    key = _reply_key(eph.exchange(X25519PublicKey.from_public_bytes(rk)), e_pub, rk)
+    iv = os.urandom(12)
+    return e_pub + iv + AESGCM(key).encrypt(iv, data, e_pub + rk)
+
+
+def decrypt_reply(priv, blob: bytes) -> bytes:
+    """The device side (used by the test tools): `priv` is the device's X25519PrivateKey."""
+    rk = priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    e_pub, iv, ct = blob[:32], blob[32:44], blob[44:]
+    key = _reply_key(priv.exchange(X25519PublicKey.from_public_bytes(e_pub)), e_pub, rk)
+    return AESGCM(key).decrypt(iv, ct, e_pub + rk)
+
+
 class VerifyKey:
     """The website's public signing key (docs/channel.json on the website), cached on disk."""
 
@@ -1001,15 +1034,22 @@ class Channel:
             self._check(self.verify.hex, sig, payload)
         return json.loads(payload)
 
-    def reply(self, obj, attachment: bytes = None):
-        """Send an encrypted message to the website (status / pong), optionally with an
-        encrypted file (screenshot)."""
+    def reply(self, obj, attachment: bytes = None, rk: bytes = None):
+        """Send a message to the website (status / pong), optionally with a file (screenshot).
+        With `rk` (the asking device's key) everything is encrypted so only that device can read it;
+        without it (an old website page) the message uses the public channel key and carries no screenshot."""
+        if rk:
+            text = base64.b64encode(encrypt_reply(rk, json.dumps(dict(obj, ts=int(time.time() * 1000)),
+                                                                   ensure_ascii=False).encode("utf-8"))).decode()
+            body = encrypt_reply(rk, attachment) if attachment else None
+        else:
+            attachment = None
+            text, body = self.seal_json(obj), None
         if attachment:
-            body = self.encrypt(attachment)
-            url = f"{RELAY}/{self.topic}-s?filename=shot.bin&message={urllib.parse.quote(self.seal_json(obj))}"
+            url = f"{RELAY}/{self.topic}-s?filename=shot.bin&message={urllib.parse.quote(text)}"
             method = "PUT"
         else:
-            body = self.seal_json(obj).encode()
+            body = text.encode()
             url = f"{RELAY}/{self.topic}-s"
             method = "POST"
         for attempt in range(4):
@@ -1130,18 +1170,24 @@ class Agent:
             log.info("Ignored an old message (%.0f minutes)", age / 60)
             return
         kind = msg.get("t")
+        rk = parse_rk(msg.get("rk"))
         if kind == "ping":
-            self.pong()
+            self.pong(rk)
         elif kind == "settings":
             self.apply_settings(msg)
         elif kind == "shot":
-            shot = take_screenshot()
-            self.ch.reply({"t": "shot", "id": str(msg.get("id", ""))[:40], "ok": bool(shot),
-                           "error": "" if shot else (SHOT_ERROR["text"] or "לא ניתן לצלם את המסך")}, shot)
+            sid = str(msg.get("id", ""))[:40]
+            if not rk:
+                self.ch.reply({"t": "shot", "id": sid, "ok": False,
+                               "error": "הדפדפן במכשיר הזה לא תומך בהצפנת תמונות, עדכנו אותו"})
+            else:
+                shot = take_screenshot()
+                self.ch.reply({"t": "shot", "id": sid, "ok": bool(shot),
+                               "error": "" if shot else (SHOT_ERROR["text"] or "לא ניתן לצלם את המסך")}, shot, rk)
         elif kind == "print":
             self.receive_job(msg, ev.get("attachment") or {})
 
-    def pong(self):
+    def pong(self, rk=None):
         printers, default = list_printers()
         health = printer_health(self.printer.configured)
         if IS_WINDOWS and not self.printer.sumatra:
@@ -1150,7 +1196,7 @@ class Agent:
         self.ch.reply({"t": "pong", "printers": printers, "default": default,
                        "printer": self.printer.configured, "host": socket.gethostname(),
                        "version": VERSION, "health": health, "word": word_installed(),
-                       "queue": self.pq.pending(), "last_job": self.last_job})
+                       "queue": self.pq.pending(), "last_job": self.last_job}, rk=rk)
 
     def apply_settings(self, msg):
         name = (msg.get("printer") or "").strip()
@@ -1162,17 +1208,19 @@ class Agent:
         self.cfg["general"]["printer_name"] = name
         save_config(self.cfg)
         log.info("Printer set from website: %s", name or "<default>")
-        self.pong()
+        self.pong(parse_rk(msg.get("rk")))
 
-    def _status(self, job_id, state, error="", detail=""):
+    def _status(self, job_id, state, error="", detail="", rk=None):
         obj = {"t": "status", "id": job_id, "state": state, "error": error, "detail": detail}
-        shot = take_screenshot() if state == "error" else None
+        shot = take_screenshot() if (state == "error" and rk) else None     # screenshots only encrypted
         obj["shot"] = bool(shot)
-        self.ch.reply(obj, shot)
+        self.ch.reply(obj, shot, rk)
 
-    def _remember_waiting(self, job_id, path, label):
+    def _remember_waiting(self, job_id, path, label, rk=None):
         with self.state_lock:
-            self.state.setdefault("waiting", {})[job_id] = {"path": str(path), "label": label, "since": int(time.time())}
+            self.state.setdefault("waiting", {})[job_id] = {
+                "path": str(path), "label": label, "since": int(time.time()),
+                "rk": base64.b64encode(rk).decode() if rk else ""}
             self._save_state()
 
     def _forget_waiting(self, job_id):
@@ -1180,7 +1228,7 @@ class Agent:
             if self.state.setdefault("waiting", {}).pop(job_id, None) is not None:
                 self._save_state()
 
-    def _make_notify(self, job_id, label, path):
+    def _make_notify(self, job_id, label, path, rk=None):
         """Callback for the print queue: state is waiting / printing / done / error."""
         def notify(state, detail=""):
             if state in ("done", "error"):
@@ -1188,18 +1236,18 @@ class Agent:
                                  "printer": self.printer.printer_name, "time": int(time.time() * 1000)}
                 self._forget_waiting(job_id)
             elif state == "waiting":
-                self._remember_waiting(job_id, path, label)     # survives a restart of the program
+                self._remember_waiting(job_id, path, label, rk)     # survives a restart of the program
             if state == "error":
-                self._status(job_id, "error", error=(detail or "")[:200])
+                self._status(job_id, "error", error=(detail or "")[:200], rk=rk)
             else:
-                self._status(job_id, state, detail=detail)
+                self._status(job_id, state, detail=detail, rk=rk)
         return notify
 
     def restore_waiting(self):
         """Jobs that were waiting for somebody to log on when the program last stopped."""
         for job_id, w in list(self.state.get("waiting", {}).items()):
             path = Path(w.get("path", ""))
-            notify = self._make_notify(job_id, w.get("label", job_id), path)
+            notify = self._make_notify(job_id, w.get("label", job_id), path, parse_rk(w.get("rk")))
             if not path.exists() or time.time() - w.get("since", 0) > PrintQueue.WAIT_MAX_SEC:
                 PrintQueue._tell(notify, "error", "לא הודפס: הקובץ כבר לא זמין")
                 continue
@@ -1213,6 +1261,7 @@ class Agent:
         self.state["jobs"].append(job_id)
         self._save_state()
         label = msg.get("label") or msg.get("name") or job_id
+        rk = parse_rk(msg.get("rk"))
 
         try:
             name = msg.get("name") or "document.pdf"
@@ -1231,12 +1280,12 @@ class Agent:
             path.write_bytes(content)
         except Exception as e:
             log.error("Job %s (%s) failed: %s", job_id, label, e)
-            self._status(job_id, "error", error=str(e) if isinstance(e, PrintError) else "הקובץ לא התקבל כראוי")
+            self._status(job_id, "error", error=str(e) if isinstance(e, PrintError) else "הקובץ לא התקבל כראוי", rk=rk)
             return
 
         log.info("Job received: %s", label)
-        self._status(job_id, "printing", detail="המחשב קיבל את הדף ושלח אותו למדפסת")
-        self.pq.submit(path, f"site/{label}", self._make_notify(job_id, label, path))
+        self._status(job_id, "printing", detail="המחשב קיבל את הדף ושלח אותו למדפסת", rk=rk)
+        self.pq.submit(path, f"site/{label}", self._make_notify(job_id, label, path, rk))
 
     @staticmethod
     def _download(url) -> bytes:
@@ -1412,6 +1461,13 @@ def selftest() -> int:
         probe.unlink()
         return str(DATA_DIR)
 
+    def reply_crypto():
+        priv = X25519PrivateKey.generate()
+        rk = priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        assert decrypt_reply(priv, encrypt_reply(rk, b"secret screenshot")) == b"secret screenshot"
+        return "X25519 + HKDF + AES-GCM"
+
+    check("reply encryption", reply_crypto)
     check("data folder", data_dir_writable)
     check("running as SYSTEM", is_system_account)
     check("task xml", lambda: len(task_xml(Path(sys.executable))))

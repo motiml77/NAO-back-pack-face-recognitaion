@@ -18,6 +18,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import remote_printer as rp   # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey  # noqa: E402
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat  # noqa: E402
 
 
 def http(url, data=None, method=None):
@@ -34,6 +36,8 @@ def main():
     ap.add_argument("--topic", default=rp.CHANNEL_TOPIC)
     ap.add_argument("--key", default=rp.CHANNEL_KEY)
     ap.add_argument("--expect-error", action="store_true", help="success = an error reply arrives")
+    ap.add_argument("--require-shot", action="store_true", help="success also needs a decryptable JPEG screenshot")
+    ap.add_argument("--legacy", action="store_true", help="act like an old website page (no device key, no screenshots)")
     ap.add_argument("mode", choices=["ping", "print", "shot"])
     ap.add_argument("file", nargs="?")
     a = ap.parse_args()
@@ -41,8 +45,15 @@ def main():
     ch = rp.Channel(a.topic, a.key, None)
     signer = Ed25519PrivateKey.from_private_bytes(rp.derive_signing_seed(a.password, a.topic))
 
+    # like the website: a device key pair; the public key travels INSIDE the signed command
+    device = X25519PrivateKey.generate()
+    rk = base64.b64encode(device.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
+
     def signed(obj):
-        payload = json.dumps(dict(obj, ts=int(time.time() * 1000)), ensure_ascii=False)
+        body = dict(obj, ts=int(time.time() * 1000))
+        if not a.legacy:
+            body["rk"] = rk
+        payload = json.dumps(body, ensure_ascii=False)
         sig = base64.b64encode(signer.sign(payload.encode())).decode()
         return ch.seal_json({"p": payload, "s": sig})
 
@@ -67,19 +78,43 @@ def main():
     while time.time() < deadline:
         for line in http(f"{rp.RELAY}/{ch.topic}-s/json?poll=1&since={start}").decode().splitlines():
             ev = json.loads(line)
+            text, ecies = ev.get("message", ""), True
             try:
-                msg = ch.open_json(ev.get("message", ""))
+                msg = json.loads(rp.decrypt_reply(device, base64.b64decode(text)))     # encrypted to this device
             except Exception:
-                continue
+                ecies = False
+                try:
+                    msg = ch.open_json(text)                                        # old-style reply (public key)
+                except Exception:
+                    continue
             if want(msg):
-                print("REPLY:", json.dumps(msg, ensure_ascii=False))
+                print("REPLY:", json.dumps(msg, ensure_ascii=False), "| encrypted to this device:", ecies)
+                if ecies:                                                           # the public key must NOT open it
+                    try:
+                        ch.open_json(text)
+                        print("PROBLEM: the public channel key can read this reply")
+                        return 1
+                    except Exception:
+                        print("public channel key cannot read it: True")
+                shot_ok = False
                 att = ev.get("attachment")
-                if att:      # screenshot: download, decrypt, check it is a JPEG
-                    img = ch.decrypt(http(att["url"]))
-                    print(f"SCREENSHOT: {len(img)} bytes, jpeg={img[:2] == bytes([0xFF, 0xD8])}")
+                if att:      # screenshot: download, decrypt with the device key, check it is a JPEG
+                    blob = http(att["url"])
+                    img = rp.decrypt_reply(device, blob)
+                    shot_ok = img[:2] == bytes([0xFF, 0xD8])
+                    try:
+                        ch.decrypt(blob)
+                        print("PROBLEM: the public channel key can open the screenshot")
+                        return 1
+                    except Exception:
+                        pass
+                    print(f"SCREENSHOT: {len(img)} bytes, jpeg={shot_ok}, public key cannot open it: True")
                 if a.mode == "shot":
-                    return 0 if msg.get("ok") else 2
+                    return 0 if (msg.get("ok") and shot_ok) else 2
                 ok = msg.get("state", "done") == "done"
+                if a.require_shot and not shot_ok:
+                    print("MISSING: no decryptable screenshot arrived")
+                    return 1
                 return 0 if ok != a.expect_error else 1
         time.sleep(3)
     print("TIMEOUT - no reply")

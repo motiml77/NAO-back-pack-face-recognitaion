@@ -127,7 +127,7 @@ footer { display: flex; justify-content: space-between; align-items: center; gap
 
     <div class="tabs" role="tablist">
       <button role="tab" aria-selected="true" data-tab="name">✍️ הדפסת שם</button>
-      <button role="tab" aria-selected="false" data-tab="file">📄 שליחת קובץ</button>
+      <button role="tab" aria-selected="false" data-tab="file">📄 קובץ או תמונה</button>
     </div>
 
     <!-- wording + name -->
@@ -157,12 +157,16 @@ footer { display: flex; justify-content: space-between; align-items: center; gap
 
     <!-- any file -->
     <section class="card" id="tab-file" hidden>
-      <h2>שליחת קובץ PDF או Word</h2>
+      <h2>שליחת קובץ PDF, Word או תמונה</h2>
       <label class="drop" id="drop">
-        <input type="file" id="file" accept=".pdf,.doc,.docx,.rtf,.odt" hidden>
-        <span id="fileLabel">לחצו כאן לבחירת קובץ</span>
+        <input type="file" id="file" accept=".pdf,.doc,.docx,.rtf,.odt,image/*" hidden>
+        <span id="fileLabel">לחצו כאן לבחירת קובץ, PDF, Word או תמונה</span>
       </label>
-      <p class="hint" id="fileHint">עד 15MB.</p>
+      <p class="hint" id="fileHint">PDF, Word או תמונה (JPG, PNG ועוד). עד 15MB.</p>
+      <div class="preview" id="imgPreviewBox" hidden style="margin-top:14px">
+        <label class="title">דוגמה לפני הדפסה</label>
+        <canvas id="imgPreview" width="1170" height="827" style="margin:0 auto" aria-label="דוגמה של הדף עם התמונה"></canvas>
+      </div>
       <div style="margin-top:14px"><button class="primary" id="sendFile" disabled>🖨️ שליחה להדפסה</button></div>
       <div class="msg" id="fileMsg" role="alert"></div>
       <div class="result" id="fileResult" hidden role="status">
@@ -187,7 +191,7 @@ footer { display: flex; justify-content: space-between; align-items: center; gap
     </section>
 
     <footer>
-      <span>רק מי שיודע את הסיסמה יכול להדפיס.</span>
+      <span>רק מי שיודע את הסיסמה יכול להדפיס. תמונות ותשובות מהמחשב מוצפנות למכשיר הזה בלבד.</span>
       <button class="link" id="logout">יציאה</button>
     </footer>
   </main>

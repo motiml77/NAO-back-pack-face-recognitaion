@@ -34,6 +34,9 @@ jobs:
       - name: Guard - the program must never be able to show a window
         run: python tools\check_silent.py
 
+      - name: Test - replies and screenshots are encrypted to the device only
+        run: python tools\test_reply_crypto.py
+
       - name: Test - HTTPS works with the bundled roots (the failure seen on a real PC)
         run: python tools\check_tls.py
 
@@ -171,8 +174,8 @@ jobs:
 
           # 6c. printer problem: pause the printer -> the program must report it
           Get-CimInstance Win32_Printer -Filter "Name='Pantum CI Test'" | Invoke-CimMethod -MethodName Pause | Out-Null
-          python tools\send_test.py --password $pw --topic $topic --key $key --expect-error print tools\test_page.pdf
-          if ($LASTEXITCODE -ne 0) { Show-Log; throw "a paused printer was not reported as a problem" }
+          python tools\send_test.py --password $pw --topic $topic --key $key --expect-error --require-shot print tools\test_page.pdf
+          if ($LASTEXITCODE -ne 0) { Show-Log; throw "a paused printer was not reported as a problem, with an encrypted screenshot" }
           Get-CimInstance Win32_Printer -Filter "Name='Pantum CI Test'" | Invoke-CimMethod -MethodName Resume | Out-Null
 
           # 6d. screenshots (need a logged-on desktop: informational on the build machine)
@@ -181,6 +184,10 @@ jobs:
           & "$app\RemotePrinter.exe" --screenshot C:\ci\direct.jpg
           Start-Sleep 3
           if (Test-Path C:\ci\direct.jpg) { Write-Host "Direct screenshot: $((Get-Item C:\ci\direct.jpg).Length) bytes" } else { Write-Host "::warning::direct screenshot not available on the build machine" }
+
+          # 6d2. an old website page (no device key) still gets answers, but never a screenshot
+          python tools\send_test.py --password $pw --topic $topic --key $key --legacy ping
+          if ($LASTEXITCODE -ne 0) { throw "an old-style ping got no answer" }
 
           # 6e. the Word helper without Word: must fail quietly with a message (exit code 3)
           $h = Start-Process "$app\RemotePrinter.exe" -ArgumentList "--word-to-pdf", "C:\ci\none.docx", "C:\ci\none.pdf", "C:\ci\none.err" -PassThru

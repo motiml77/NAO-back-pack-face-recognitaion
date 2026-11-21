@@ -1,5 +1,6 @@
 import { login, resume, WrongPassword } from "./link.js";
-import { loadAssets, drawPage, cleanLines, canvasToPdf, PRESETS, MAX_TITLE_LINES, MAX_NAME_LINES } from "./render.js";
+import { loadAssets, drawPage, cleanLines, canvasToPdf, PRESETS, MAX_TITLE_LINES, MAX_NAME_LINES,
+         isImageFile, decodeImage, imagePageSizes, drawImagePage } from "./render.js";
 
 const $ = (id) => document.getElementById(id);
 const SAVED_KEY = "rp-link";
@@ -359,25 +360,74 @@ $("sendName").addEventListener("click", async () => {
   await sendJob({ name: `${doc.title[0]} - ${doc.names[0]}.pdf`, label }, pdf, $("sendName"), $("nameMsg"), $("nameResult"));
 });
 
-// ================================================================ file
+// ================================================================ file or image
+const MAX_IMAGE = 40 * 1024 * 1024;     // a photo is shrunk to a ~1 MB PDF before sending
 let chosen = null;
+let chosenImage = null;
+
 function updateFileHint() {
+  if (chosenImage) {
+    $("fileHint").textContent = "התמונה תודפס על דף A4 שלם (לאורך או לרוחב, לפי התמונה), ממורכזת ובפרופורציות המקוריות.";
+    return;
+  }
   const isWord = chosen && !/\.pdf$/i.test(chosen.name);
   $("fileHint").textContent = isWord && !wordOnPc
     ? "⚠️ במחשב של המדפסת לא מותקן Word, ולכן קבצי Word לא יודפסו. שלחו PDF."
-    : "עד 15MB. קבצי Word מודפסים אם במחשב של המדפסת מותקן Word.";
+    : "PDF, Word או תמונה (JPG, PNG ועוד). עד 15MB. קבצי Word מודפסים אם במחשב של המדפסת מותקן Word.";
 }
-$("file").addEventListener("change", () => {
+
+$("file").addEventListener("change", async () => {
   chosen = $("file").files[0] || null;
+  chosenImage = null;
+  $("imgPreviewBox").hidden = true;
   $("drop").classList.toggle("has", !!chosen);
-  $("fileLabel").textContent = chosen ? `📄 ${chosen.name}` : "לחצו כאן לבחירת קובץ";
-  $("sendFile").disabled = !chosen || chosen.size > MAX_FILE;
-  $("fileMsg").textContent = chosen && chosen.size > MAX_FILE ? "הקובץ גדול מ-15MB." : "";
+  const image = isImageFile(chosen);
+  $("fileLabel").textContent = chosen ? `${image ? "🖼️" : "📄"} ${chosen.name}` : "לחצו כאן לבחירת קובץ, PDF, Word או תמונה";
+  const limit = image ? MAX_IMAGE : MAX_FILE;
+  $("sendFile").disabled = !chosen || chosen.size > limit;
+  $("fileMsg").textContent = chosen && chosen.size > limit ? `הקובץ גדול מ-${limit / 1024 / 1024}MB.` : "";
   $("fileResult").hidden = true;
+  if (chosen && image && chosen.size <= limit) {
+    try {
+      chosenImage = await decodeImage(chosen);
+      const [w, h] = imagePageSizes(chosenImage)[1];
+      const prev = $("imgPreview");
+      prev.width = w / 2;                        // ~100 dpi is plenty for the preview
+      prev.height = h / 2;
+      prev.style.maxWidth = w >= h ? "100%" : "360px";
+      drawImagePage(prev, chosenImage);
+      $("imgPreviewBox").hidden = false;
+    } catch {
+      $("fileMsg").textContent = "הדפדפן לא מצליח לפתוח את סוג התמונה הזה. נסו JPG או PNG (באייפון: הגדרות ← מצלמה ← פורמטים ← תואם ביותר).";
+      $("sendFile").disabled = true;
+    }
+  }
   updateFileHint();
 });
+
+// A photo becomes one print-ready A4 PDF here in the browser, so the printer computer prints it like any PDF.
+async function imageToPdf(image) {
+  for (const [w, h] of imagePageSizes(image)) {
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      drawImagePage(canvas, image);
+      return await canvasToPdf(canvas);
+    } catch { /* this device could not make such a large page - try the smaller one */ }
+  }
+  return null;
+}
+
 $("sendFile").addEventListener("click", async () => {
   if (!chosen) return;
+  if (chosenImage) {
+    const pdf = await imageToPdf(chosenImage);
+    if (!pdf) { $("fileMsg").textContent = "לא הצלחתי להכין את התמונה להדפסה במכשיר הזה."; return; }
+    const base = chosen.name.replace(/\.[^.]+$/, "") || "תמונה";
+    await sendJob({ name: `${base}.pdf`, label: chosen.name }, pdf, $("sendFile"), $("fileMsg"), $("fileResult"));
+    return;
+  }
   await sendJob({ name: chosen.name, label: chosen.name }, new Uint8Array(await chosen.arrayBuffer()),
     $("sendFile"), $("fileMsg"), $("fileResult"));
 });

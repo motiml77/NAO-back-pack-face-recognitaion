@@ -136,7 +136,7 @@ with tempfile.TemporaryDirectory() as tmp:
     replies = []
 
     class FakeChannel:
-        def reply(self, obj, attachment=None):
+        def reply(self, obj, attachment=None, rk=None):
             replies.append(obj)
 
     agent = rp.Agent(None, FakeChannel(), FakePrinter(world), q)

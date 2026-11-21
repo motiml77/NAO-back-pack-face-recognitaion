@@ -159,7 +159,7 @@ export async function canvasToPdf(canvas) {
     offsets[n] = length;
     push(`${n} 0 obj\n${body}\nendobj\n`);
   };
-  const pw = 842, ph = 595;   // A4 landscape in points
+  const [pw, ph] = canvas.width >= canvas.height ? [842, 595] : [595, 842];   // A4 in points, by orientation
 
   push("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
   obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
@@ -183,4 +183,46 @@ export async function canvasToPdf(canvas) {
   let pos = 0;
   for (const p of parts) { out.set(p, pos); pos += p.length; }
   return out;
+}
+
+
+// ---- image files: any photo becomes one A4 page (portrait or landscape, whichever fits the photo better)
+const IMAGE_NAME = /\.(jpe?g|png|gif|webp|bmp|avif|heic|heif)$/i;
+export const isImageFile = (f) => !!f && ((f.type || "").startsWith("image/") || IMAGE_NAME.test(f.name || ""));
+
+// Canvas sizes for the printed page: 300 dpi, and 200 dpi for devices that cannot make such a large canvas.
+export function imagePageSizes(image) {
+  const landscape = (image.naturalWidth || image.width) >= (image.naturalHeight || image.height);
+  return [[3508, 2480], [2339, 1654]].map(([w, h]) => (landscape ? [w, h] : [h, w]));
+}
+
+export async function decodeImage(file) {
+  try {
+    return await createImageBitmap(file);                  // applies the rotation stored in a phone photo
+  } catch {
+    const url = URL.createObjectURL(file);
+    try {
+      const img = new Image();
+      img.src = url;
+      await img.decode();
+      return img;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+}
+
+// White page, the image as large as fits inside a small margin, centred, proportions kept.
+export function drawImagePage(canvas, image) {
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const iw = image.naturalWidth || image.width, ih = image.naturalHeight || image.height;
+  const margin = Math.round(canvas.width * 0.03);
+  const scale = Math.min((canvas.width - 2 * margin) / iw, (canvas.height - 2 * margin) / ih);
+  const w = iw * scale, h = ih * scale;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(image, (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
 }
