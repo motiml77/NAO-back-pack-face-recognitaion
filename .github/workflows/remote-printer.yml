@@ -72,7 +72,7 @@ jobs:
       - name: Build installer
         run: |
           if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=3.6.${{ github.run_number }} installer\RemotePrinter.iss
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=3.7.${{ github.run_number }} installer\RemotePrinter.iss
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Get-Item dist\RemotePrinter-Setup.exe | Format-List Name, Length
 
@@ -196,29 +196,6 @@ jobs:
           Write-Host "Word helper exit code: $($h.ExitCode); message: $(Get-Content C:\ci\none.err -ErrorAction SilentlyContinue)"
           if ($h.ExitCode -ne 3) { throw "the Word helper should exit with 3 when Word is missing" }
 
-          # 6f. the screen is LOCKED (a user is still logged on): it must keep answering and printing
-          Add-Type -Namespace RpTest -Name Win -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool LockWorkStation();'
-          $locked = $false
-          if ([RpTest.Win]::LockWorkStation()) {
-            for ($i = 0; $i -lt 20 -and -not $locked; $i++) { Start-Sleep 1; $locked = [bool](Get-Process LogonUI -ErrorAction SilentlyContinue) }
-          }
-          Write-Host "Workstation locked: $locked"
-          if (-not $locked) {
-            Write-Host "::warning::could not lock the build machine's screen - the locked-screen case was NOT verified in this run"
-          } else {
-            python tools\send_test.py --password $pw --topic $topic --key $key ping
-            if ($LASTEXITCODE -ne 0) { Show-Log; throw "no answer while the screen is locked" }
-            Remove-Item C:\ci\printed.pdf -ErrorAction SilentlyContinue
-            python tools\send_test.py --password $pw --topic $topic --key $key print tools\test_page.pdf
-            if ($LASTEXITCODE -ne 0) { Show-Log; Show-PrintDiagnostics; throw "printing failed while the screen is locked" }
-            Start-Sleep 2
-            $out = Get-Item C:\ci\printed.pdf -ErrorAction SilentlyContinue
-            if (-not $out -or $out.Length -lt 1000) { Show-Log; throw "no printer output while the screen is locked" }
-            Write-Host "Printed while locked: $($out.Length) bytes"
-            python tools\send_test.py --password $pw --topic $topic --key $key --timeout 45 shot
-            Write-Host "(screenshot while locked: exit code $LASTEXITCODE - a locked screen cannot be captured; the program must answer with a reason)"
-          }
-
           # 7. unsupported file -> a clean error reply
           python tools\send_test.py --password $pw --topic $topic --key $key --expect-error print ..\docs\fonts\StamAshkenazCLM-LICENSE.txt
           if ($LASTEXITCODE -ne 0) { throw "expected an error reply for an unsupported file" }
@@ -259,11 +236,79 @@ jobs:
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: remote-printer-3.6.${{ github.run_number }}
-          name: הדפסה מרחוק 3.6.${{ github.run_number }}
+          tag_name: remote-printer-3.7.${{ github.run_number }}
+          name: הדפסה מרחוק 3.7.${{ github.run_number }}
           target_commitish: ${{ github.sha }}
           make_latest: true
           files: remote-printer/dist/RemotePrinter-Setup.exe
           body: |
             תוכנת ההתקנה למחשב שמחובר למדפסת (Windows 10 / 11). התקנה אוטומטית לגמרי, הכול בפנים, ועולה לבד אחרי כל הפעלה של המחשב.
             אתר ההדפסה: https://motiml77.github.io/NAO-back-pack-face-recognitaion/
+
+  # Runs on its own machine AFTER the build job (the release is already published by then), so an exploratory
+  # test can never hold back a release: the installed program must keep answering and printing while the
+  # Windows screen is LOCKED.
+  locked-screen:
+    needs: build
+    if: ${{ always() }}
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: remote-printer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: RemotePrinter-Setup
+          path: remote-printer/dist
+
+      - name: Test - install, then lock the screen, then ping and print
+        run: |
+          $data = "$env:ProgramData\RemotePrinter"
+          function Show-Log { Get-Content "$data\remote_printer.log" -ErrorAction SilentlyContinue | Select-Object -Last 60 }
+          $pw = "ci-" + [guid]::NewGuid().ToString("N").Substring(0, 12)
+          $lines = python tools\test_channel.py $pw
+          $topic = ($lines | Select-String "^topic = ").ToString().Split("= ")[-1]
+          $key = ($lines | Select-String "^key = ").ToString().Split("= ")[-1]
+          Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $data | Out-Null
+          Set-Content "$data\config.ini" (@("[general]") + $lines) -Encoding utf8
+          New-Item -ItemType Directory -Force C:\ci | Out-Null
+          Add-PrinterPort -Name "C:\ci\printed.pdf"
+          Add-Printer -Name "Pantum CI Test" -DriverName "Microsoft Print To PDF" -PortName "C:\ci\printed.pdf"
+          $p = Start-Process dist\RemotePrinter-Setup.exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -PassThru
+          $null = $p.Handle
+          if (-not $p.WaitForExit(300000)) { $p.Kill(); throw "the installer did not finish" }
+          Start-Sleep 12
+          Write-Host "--- sessions before locking"; query session
+          python tools\send_test.py --password $pw --topic $topic --key $key ping
+          if ($LASTEXITCODE -ne 0) { Show-Log; throw "no answer before locking (the test itself is broken)" }
+
+          Add-Type -Namespace RpTest -Name Win -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool LockWorkStation();'
+          $locked = $false
+          if ([RpTest.Win]::LockWorkStation()) {
+            for ($i = 0; $i -lt 20 -and -not $locked; $i++) { Start-Sleep 1; $locked = [bool](Get-Process LogonUI -ErrorAction SilentlyContinue) }
+          }
+          Write-Host "Workstation locked: $locked"
+          Write-Host "--- sessions after locking"; query session
+          if (-not $locked) { Write-Host "::warning::could not lock the build machine's screen - the locked-screen case was NOT verified"; exit 0 }
+
+          python tools\send_test.py --password $pw --topic $topic --key $key --timeout 60 ping
+          if ($LASTEXITCODE -ne 0) { Show-Log; throw "no answer while the screen is locked" }
+          Remove-Item C:\ci\printed.pdf -ErrorAction SilentlyContinue
+          python tools\send_test.py --password $pw --topic $topic --key $key --timeout 90 print tools\test_page.pdf
+          $rc = $LASTEXITCODE
+          Show-Log
+          if ($rc -ne 0) { throw "printing failed while the screen is locked" }
+          Start-Sleep 2
+          $out = Get-Item C:\ci\printed.pdf -ErrorAction SilentlyContinue
+          if (-not $out -or $out.Length -lt 1000) { throw "no printer output while the screen is locked" }
+          Write-Host "Printed while locked: $($out.Length) bytes"
+          python tools\send_test.py --password $pw --topic $topic --key $key --timeout 45 shot
+          Write-Host "(screenshot while locked: exit code $LASTEXITCODE - a locked screen cannot be captured, the program must answer with a reason)"
