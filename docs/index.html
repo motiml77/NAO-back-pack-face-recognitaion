@@ -137,7 +137,7 @@ footer { display: flex; justify-content: space-between; align-items: center; gap
       <label class="title" for="title">טקסט הנוסח (אפשר לשנות או לכתוב נוסח משלכם)</label>
       <textarea id="title" rows="2" maxlength="200"></textarea>
 
-      <label class="title" for="name1">באמצע הדף: עד 3 שורות, באותיות גדולות</label>
+      <label class="title" for="name1">השם, באמצע הדף: אפשר לכתוב עד 3 שורות (באותיות גדולות)</label>
       <input type="text" id="name1" maxlength="80" placeholder="שורה 1, למשל: שרה בת רחל" autocomplete="off">
       <input type="text" id="name2" maxlength="80" placeholder="שורה 2 (לא חובה)" autocomplete="off" style="margin-top:8px">
       <input type="text" id="name3" maxlength="80" placeholder="שורה 3 (לא חובה)" autocomplete="off" style="margin-top:8px">
@@ -195,9 +195,10 @@ footer { display: flex; justify-content: space-between; align-items: center; gap
     <footer>
       <span>רק מי שיודע את הסיסמה יכול להדפיס. תמונות ותשובות מהמחשב מוצפנות למכשיר הזה בלבד.</span>
       <button class="link" id="logout">יציאה</button>
+      <span style="flex-basis:100%;text-align:center;font-size:12px" id="siteVersion">גרסת האתר: __BUILD__ · __BUILT__</span>
     </footer>
   </main>
 </div>
-<script type="module" src="app.js"></script>
+<script type="module" src="app.js?v=__BUILD__"></script>
 </body>
 </html>
