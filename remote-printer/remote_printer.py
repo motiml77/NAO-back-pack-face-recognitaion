@@ -42,6 +42,7 @@ import queue
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -64,7 +65,7 @@ except Exception as _e:   # pragma: no cover
     InvalidSignature = Exception
     CRYPTO_ERROR = repr(_e)
 
-VERSION = "3.5"
+VERSION = "3.6"
 FROZEN = getattr(sys, "frozen", False)
 IS_WINDOWS = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
@@ -102,6 +103,47 @@ SUPPORTED_EXT = PDF_EXT | WORD_EXT
 PRINT_TIMEOUT_SEC = 180
 SINGLE_INSTANCE_PORT = 47631
 CREATE_NO_WINDOW = 0x08000000
+
+
+# Screenshots are switched off until the replies from this computer are encrypted so that only the
+# holder of the website password can read them (today the channel key is public).
+SCREENSHOTS_ENABLED = False
+
+_OPENER = None
+
+
+def http_open(req, timeout=30):
+    """urlopen with a trust list made of the Windows certificate store PLUS the standard roots shipped
+    with this program (certifi). Python does not ask Windows to download roots it has not seen yet, so on
+    a computer where, say, 'ISRG Root X1' was never needed by a browser, every connection failed with
+    'CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate'."""
+    global _OPENER
+    if _OPENER is None:
+        ctx = ssl.create_default_context()                      # Windows store
+        try:
+            import certifi
+            ctx.load_verify_locations(cafile=certifi.where())   # + bundled roots
+        except Exception as e:
+            log.warning("Bundled certificate roots not available: %s", e)
+        _OPENER = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+    return _OPENER.open(req, timeout=timeout)
+
+
+def describe_tls_issuer(host):
+    """For the log only: who signed the certificate this computer is shown for `host`
+    (a filtering proxy that re-signs HTTPS shows up here). Nothing is sent - the handshake is read and closed."""
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE         # diagnostic only: no data is exchanged
+        with socket.create_connection((host, 443), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as tls:
+                der = tls.getpeercert(binary_form=True)
+        from cryptography import x509
+        cert = x509.load_der_x509_certificate(der)
+        return f"issuer={cert.issuer.rfc4514_string()} | subject={cert.subject.rfc4514_string()}"
+    except Exception as e:
+        return f"could not inspect ({e})"
 
 
 def quiet_kwargs():
@@ -444,6 +486,9 @@ def _grab_screen():
 def take_screenshot():
     """JPEG of the whole screen (all monitors), or None. Used to show the problem on the website."""
     SHOT_ERROR["text"] = ""
+    if not SCREENSHOTS_ENABLED:
+        SHOT_ERROR["text"] = "צילום מסך כבוי זמנית, עד שתתווסף הצפנה מלאה לתמונות"
+        return None
     if is_system_account():       # the screen belongs to the logged-on user - ask a helper in that session
         out = DATA_DIR / "tmp" / f"shot-{os.getpid()}-{int(time.time())}.jpg"
         try:
@@ -893,7 +938,7 @@ class VerifyKey:
         try:
             req = urllib.request.Request(SITE_URL + "channel.json?t=" + str(int(time.time())),
                                          headers={"User-Agent": USER_AGENT, "Cache-Control": "no-cache"})
-            with urllib.request.urlopen(req, timeout=20) as r:
+            with http_open(req, timeout=20) as r:
                 data = json.loads(r.read().decode("utf-8"))
             if data.get("topic") != CHANNEL_TOPIC:
                 log.warning("channel.json is for a different channel - ignored")
@@ -970,7 +1015,7 @@ class Channel:
         for attempt in range(4):
             req = urllib.request.Request(url, data=body, headers={"User-Agent": USER_AGENT}, method=method)
             try:
-                with urllib.request.urlopen(req, timeout=20) as r:
+                with http_open(req, timeout=20) as r:
                     r.read()
                 return
             except urllib.error.HTTPError as e:
@@ -1033,7 +1078,7 @@ class Agent:
             url = f"{RELAY}/{self.ch.topic}/json?since={urllib.parse.quote(since)}"
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-                with urllib.request.urlopen(req, timeout=120) as stream:
+                with http_open(req, timeout=120) as stream:
                     log.info("Connected - waiting for print jobs.")
                     delay = 5
                     for line in self._lines(stream):   # ntfy sends a keepalive every ~45s
@@ -1048,8 +1093,17 @@ class Agent:
                         self._save_state()
             except Exception as e:
                 log.warning("Connection problem: %s (retry in %ss)", e, delay)
+                self._explain_tls(e)
                 time.sleep(delay)
                 delay = min(delay * 2, 120)
+
+    def _explain_tls(self, err):
+        """A certificate problem: log who signed what this computer is shown (at most every 10 minutes)."""
+        if "CERTIFICATE_VERIFY_FAILED" not in str(err) or time.time() - getattr(self, "_tls_logged", 0) < 600:
+            return
+        self._tls_logged = time.time()
+        for host in ("ntfy.sh", "motiml77.github.io"):
+            log.warning("TLS check %s: %s", host, describe_tls_issuer(host))
 
     @staticmethod
     def _lines(stream):
@@ -1187,7 +1241,7 @@ class Agent:
     @staticmethod
     def _download(url) -> bytes:
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=120) as r:
+        with http_open(req, timeout=120) as r:
             data = r.read(MAX_FILE_BYTES + 1)
         if len(data) > MAX_FILE_BYTES:
             raise PrintError("הקובץ גדול מדי")
@@ -1361,6 +1415,11 @@ def selftest() -> int:
     check("data folder", data_dir_writable)
     check("running as SYSTEM", is_system_account)
     check("task xml", lambda: len(task_xml(Path(sys.executable))))
+    def tls_ok():
+        with http_open(urllib.request.Request("https://ntfy.sh/v1/health", headers={"User-Agent": USER_AGENT}), timeout=20) as r:
+            return f"ntfy.sh HTTP {r.status}"
+
+    check("TLS (Windows store + bundled roots)", tls_ok)
     check("printer health", lambda: printer_health(""))
     check("website key", lambda: VerifyKey(load_config(), lambda k, d: d, lambda k, v: None).get()[:12] or "not reachable")
     check("Word installed", word_installed)

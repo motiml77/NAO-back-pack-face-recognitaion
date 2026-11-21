@@ -34,6 +34,9 @@ jobs:
       - name: Guard - the program must never be able to show a window
         run: python tools\check_silent.py
 
+      - name: Test - HTTPS works with the bundled roots (the failure seen on a real PC)
+        run: python tools\check_tls.py
+
       - name: Test - jobs wait for a login and print by themselves afterwards
         run: python tools\test_queue.py
 
@@ -49,7 +52,7 @@ jobs:
           Copy-Item $exe.FullName installer\SumatraPDF.exe
 
       - name: Build program
-        run: pyinstaller --noconfirm --noconsole --onedir --name RemotePrinter --collect-submodules cryptography --hidden-import win32timezone remote_printer.py
+        run: pyinstaller --noconfirm --noconsole --onedir --name RemotePrinter --collect-submodules cryptography --collect-data certifi --hidden-import win32timezone remote_printer.py
 
       - name: Self-test of the built program
         run: |
@@ -66,7 +69,7 @@ jobs:
       - name: Build installer
         run: |
           if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=3.5.${{ github.run_number }} installer\RemotePrinter.iss
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=3.6.${{ github.run_number }} installer\RemotePrinter.iss
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Get-Item dist\RemotePrinter-Setup.exe | Format-List Name, Length
 
@@ -226,8 +229,8 @@ jobs:
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: remote-printer-3.5.${{ github.run_number }}
-          name: הדפסה מרחוק 3.5.${{ github.run_number }}
+          tag_name: remote-printer-3.6.${{ github.run_number }}
+          name: הדפסה מרחוק 3.6.${{ github.run_number }}
           target_commitish: ${{ github.sha }}
           make_latest: true
           files: remote-printer/dist/RemotePrinter-Setup.exe

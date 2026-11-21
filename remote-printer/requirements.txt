@@ -1,4 +1,5 @@
 # Packaged into the Windows program by the build (see .github/workflows/remote-printer.yml)
 cryptography
+certifi
 pillow
 pywin32; sys_platform == "win32"

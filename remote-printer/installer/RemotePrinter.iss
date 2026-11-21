@@ -10,7 +10,7 @@
 #define AppExe "RemotePrinter.exe"
 #define SiteUrl "https://motiml77.github.io/NAO-back-pack-face-recognitaion/"
 #ifndef AppVersion
-  #define AppVersion "3.5"
+  #define AppVersion "3.6"
 #endif
 
 [Setup]
