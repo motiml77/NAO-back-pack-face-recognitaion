@@ -2,7 +2,11 @@
 //
 // Messages travel through ntfy.sh (a free public relay, no account needed) on a fixed
 // channel that is also built into the printer program (channel.json).
-// - Everything is encrypted (AES-256-GCM).
+// - Commands are encrypted with the channel key (AES-256-GCM). That key is PUBLIC (channel.json), so this
+//   hides nothing from somebody who looks for it - what protects the printer is the signature.
+// - Replies (printer state, job status, SCREENSHOTS) are encrypted to THIS device: every command carries the
+//   device's X25519 public key "rk" inside the signed part, and the printer computer encrypts its answer to it
+//   (ECIES: X25519 + HKDF-SHA256 + AES-256-GCM). Only this browser holds the private key.
 // - Every command is digitally signed (Ed25519) with a key derived from the site password.
 //   The printer program knows only the public key (channel.json "verify"), so it can check
 //   signatures but nobody can produce one without the password. Unsigned messages are ignored.
@@ -27,6 +31,43 @@ function unb64(s) {
   return out;
 }
 const b64urlToHex = (s) => hex(unb64(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4)));
+
+const REPLY_INFO = enc.encode("remote-printer/reply/v1");
+const concat = (a, b) => { const o = new Uint8Array(a.length + b.length); o.set(a); o.set(b, a.length); return o; };
+const b64urlToBytes = (s) => unb64(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4));
+
+// This device's reply key pair, created once and kept in the browser. Null when the browser has no X25519:
+// then replies stay readable by anybody, so the printer computer sends no screenshots.
+export async function loadDeviceKey() {
+  try {
+    let jwk = null;
+    try { jwk = JSON.parse(localStorage.getItem("rp-device") || "null"); } catch {}
+    let priv;
+    if (jwk && jwk.d && jwk.x) {
+      priv = await crypto.subtle.importKey("jwk", jwk, { name: "X25519" }, true, ["deriveBits"]);
+    } else {
+      priv = (await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"])).privateKey;
+      jwk = await crypto.subtle.exportKey("jwk", priv);
+      try { localStorage.setItem("rp-device", JSON.stringify({ kty: jwk.kty, crv: jwk.crv, d: jwk.d, x: jwk.x })); } catch {}
+    }
+    return { priv, rk: b64urlToBytes(jwk.x) };
+  } catch {
+    return null;
+  }
+}
+
+// e_pub(32) | iv(12) | AES-GCM(key, iv, data, aad = e_pub | rk),  key = HKDF-SHA256(X25519(priv, e_pub), salt = e_pub | rk)
+export async function decryptReply(device, blob) {
+  if (blob.length < 32 + 12 + 16) throw new Error("reply too short");
+  const ePub = blob.subarray(0, 32), iv = blob.subarray(32, 44), ct = blob.subarray(44);
+  const peer = await crypto.subtle.importKey("raw", ePub, { name: "X25519" }, false, []);
+  const shared = await crypto.subtle.deriveBits({ name: "X25519", public: peer }, device.priv, 256);
+  const salt = concat(ePub, device.rk);
+  const hk = await crypto.subtle.importKey("raw", shared, "HKDF", false, ["deriveKey"]);
+  const key = await crypto.subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt, info: REPLY_INFO }, hk,
+    { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+  return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv, additionalData: salt }, key, ct));
+}
 
 export class WrongPassword extends Error {}
 export class OldBrowser extends Error {}
@@ -75,11 +116,12 @@ async function open(seed, ch) {
   const signer = await signerFromSeed(seed);
   if (signer.publicHex !== ch.verify) throw new WrongPassword("הסיסמה שגויה");
   const aes = await crypto.subtle.importKey("raw", unhex(ch.key), "AES-GCM", false, ["encrypt", "decrypt"]);
-  return new Link(ch, aes, signer.key, hex(seed));
+  return new Link(ch, aes, signer.key, hex(seed), await loadDeviceKey());
 }
 
 class Link {
-  constructor(ch, aes, signKey, seedHex) {
+  constructor(ch, aes, signKey, seedHex, device) {
+    this.device = device;
     this.relay = ch.relay || "https://ntfy.sh";
     this.topic = ch.topic;
     this.aes = aes;
@@ -102,13 +144,19 @@ class Link {
 
   // signed + encrypted command
   async seal(obj) {
-    const payload = JSON.stringify({ ...obj, ts: Date.now() });
+    const body = { ...obj, ts: Date.now() };
+    if (this.device) body.rk = b64(this.device.rk);          // inside the signed part: cannot be swapped
+    const payload = JSON.stringify(body);
     const sig = new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, this.signKey, enc.encode(payload)));
     return b64(await this.encrypt(enc.encode(JSON.stringify({ p: payload, s: b64(sig) }))));
   }
 
   async openReply(text) {
-    return JSON.parse(dec.decode(await this.decrypt(unb64(text))));
+    const raw = unb64(text);
+    if (this.device) {
+      try { return JSON.parse(dec.decode(await decryptReply(this.device, raw))); } catch { /* not for this device */ }
+    }
+    return JSON.parse(dec.decode(await this.decrypt(raw)));   // replies of an older program version
   }
 
   static async check(res) {
@@ -134,7 +182,8 @@ class Link {
   async fetchImage(attachment) {
     const res = await fetch(attachment.url);
     if (!res.ok) throw new Error("התמונה כבר לא זמינה");
-    const plain = await this.decrypt(new Uint8Array(await res.arrayBuffer()));
+    if (!this.device) throw new Error("הדפדפן לא תומך בהצפנת תמונות");
+    const plain = await decryptReply(this.device, new Uint8Array(await res.arrayBuffer()));
     return URL.createObjectURL(new Blob([plain], { type: "image/jpeg" }));
   }
 
