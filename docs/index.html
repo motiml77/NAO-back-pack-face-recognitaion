@@ -26,7 +26,7 @@ input[type=password], input[type=text], textarea, select {
 }
 textarea { resize: vertical; }
 #title, #footer { font-size: 18px; }
-#names { font-size: 24px; font-weight: 600; min-height: 60px; }
+#name1, #name2, #name3 { font-size: 22px; font-weight: 600; }
 textarea:focus, input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 button { font: inherit; cursor: pointer; border-radius: 10px; border: 1px solid var(--line); background: #fff; padding: 10px 16px; color: var(--ink); }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 700; font-size: 19px; padding: 15px 18px; width: 100%; }
@@ -137,9 +137,11 @@ footer { display: flex; justify-content: space-between; align-items: center; gap
       <label class="title" for="title">טקסט הנוסח (אפשר לשנות או לכתוב נוסח משלכם)</label>
       <textarea id="title" rows="2" maxlength="200"></textarea>
 
-      <label class="title" for="names">השם (יופיע באותיות גדולות)</label>
-      <textarea id="names" rows="1" maxlength="300" placeholder="שרה בת רחל"></textarea>
-      <p class="hint">אפשר כמה שמות, כל שם בשורה נפרדת.</p>
+      <label class="title" for="name1">באמצע הדף: עד 3 שורות, באותיות גדולות</label>
+      <input type="text" id="name1" maxlength="80" placeholder="שורה 1, למשל: שרה בת רחל" autocomplete="off">
+      <input type="text" id="name2" maxlength="80" placeholder="שורה 2 (לא חובה)" autocomplete="off" style="margin-top:8px">
+      <input type="text" id="name3" maxlength="80" placeholder="שורה 3 (לא חובה)" autocomplete="off" style="margin-top:8px">
+      <p class="hint">שורה אחת לפחות. שורות 2 ו-3 לא חובה, ושורה ריקה לא מודפסת.</p>
 
       <label class="title" for="footer">שורה תחתונה (לא חובה)</label>
       <input type="text" id="footer" maxlength="80">

@@ -196,6 +196,29 @@ jobs:
           Write-Host "Word helper exit code: $($h.ExitCode); message: $(Get-Content C:\ci\none.err -ErrorAction SilentlyContinue)"
           if ($h.ExitCode -ne 3) { throw "the Word helper should exit with 3 when Word is missing" }
 
+          # 6f. the screen is LOCKED (a user is still logged on): it must keep answering and printing
+          Add-Type -Namespace RpTest -Name Win -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool LockWorkStation();'
+          $locked = $false
+          if ([RpTest.Win]::LockWorkStation()) {
+            for ($i = 0; $i -lt 20 -and -not $locked; $i++) { Start-Sleep 1; $locked = [bool](Get-Process LogonUI -ErrorAction SilentlyContinue) }
+          }
+          Write-Host "Workstation locked: $locked"
+          if (-not $locked) {
+            Write-Host "::warning::could not lock the build machine's screen - the locked-screen case was NOT verified in this run"
+          } else {
+            python tools\send_test.py --password $pw --topic $topic --key $key ping
+            if ($LASTEXITCODE -ne 0) { Show-Log; throw "no answer while the screen is locked" }
+            Remove-Item C:\ci\printed.pdf -ErrorAction SilentlyContinue
+            python tools\send_test.py --password $pw --topic $topic --key $key print tools\test_page.pdf
+            if ($LASTEXITCODE -ne 0) { Show-Log; Show-PrintDiagnostics; throw "printing failed while the screen is locked" }
+            Start-Sleep 2
+            $out = Get-Item C:\ci\printed.pdf -ErrorAction SilentlyContinue
+            if (-not $out -or $out.Length -lt 1000) { Show-Log; throw "no printer output while the screen is locked" }
+            Write-Host "Printed while locked: $($out.Length) bytes"
+            python tools\send_test.py --password $pw --topic $topic --key $key --timeout 45 shot
+            Write-Host "(screenshot while locked: exit code $LASTEXITCODE - a locked screen cannot be captured; the program must answer with a reason)"
+          }
+
           # 7. unsupported file -> a clean error reply
           python tools\send_test.py --password $pw --topic $topic --key $key --expect-error print ..\docs\fonts\StamAshkenazCLM-LICENSE.txt
           if ($LASTEXITCODE -ne 0) { throw "expected an error reply for an unsupported file" }

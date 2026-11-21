@@ -1,5 +1,5 @@
 import { login, resume, WrongPassword } from "./link.js";
-import { loadAssets, drawPage, cleanLines, canvasToPdf, PRESETS, MAX_TITLE_LINES, MAX_NAME_LINES,
+import { loadAssets, drawPage, cleanLines, canvasToPdf, PRESETS, MAX_TITLE_LINES,
          isImageFile, decodeImage, imagePageSizes, drawImagePage } from "./render.js";
 
 const $ = (id) => document.getElementById(id);
@@ -273,7 +273,7 @@ PRESETS.forEach((p, i) => {
 function currentDoc() {
   return {
     title: cleanLines($("title").value, MAX_TITLE_LINES),
-    names: cleanLines($("names").value, MAX_NAME_LINES),
+    names: NAME_FIELDS.map((id) => $(id).value.replace(/\s+/g, " ").trim()).filter(Boolean),   // up to 3 lines, empty ones skipped
     footer: $("footer").value.replace(/\s+/g, " ").trim(),
   };
 }
@@ -291,9 +291,10 @@ function redraw() {
     drawPage($("preview"), currentDoc(), true);
   });
 }
-for (const id of ["title", "names", "footer"]) {
+const NAME_FIELDS = ["name1", "name2", "name3"];
+for (const id of ["title", ...NAME_FIELDS, "footer"]) {
   $(id).addEventListener("input", () => {
-    if (id !== "footer") autoGrow($(id));
+    if (id === "title") autoGrow($(id));
     if (id === "title") {   // typing your own wording = "custom"
       const match = PRESETS.find((p) => p.title === $("title").value.trim());
       document.querySelectorAll("#presets button").forEach((b, i) =>
@@ -333,7 +334,7 @@ $("sendName").addEventListener("click", async () => {
   const doc = currentDoc();
   if (!doc.names.length) {
     $("nameMsg").textContent = "צריך לכתוב שם.";
-    $("names").focus();
+    $("name1").focus();
     return;
   }
   if (!doc.title.length) {
