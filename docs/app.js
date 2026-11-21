@@ -19,6 +19,11 @@ const store = {
 let link = null;
 let events = null;
 let assetsReady = null;
+// The frame, ornament and font of the page. If loading fails (bad connection) the next draw tries again.
+function ensureAssets() {
+  if (!assetsReady) assetsReady = loadAssets().catch((e) => { assetsReady = null; throw e; });
+  return assetsReady;
+}
 let health = null;          // last answer from the printer computer
 let lastPong = 0;
 let pongTimer = null;
@@ -207,8 +212,6 @@ async function startSession(newLink) {
   events?.close();
   events = link.listen(onReply);
   check();
-  assetsReady = assetsReady || loadAssets();
-  await assetsReady;
   redraw();
 }
 
@@ -286,9 +289,14 @@ function autoGrow(el) {
 function redraw() {
   cancelAnimationFrame(raf);
   raf = requestAnimationFrame(async () => {
-    if (!assetsReady) return;
-    await assetsReady;
-    drawPage($("preview"), currentDoc(), true);
+    try {
+      await ensureAssets();
+      drawPage($("preview"), currentDoc(), true);
+      $("previewMsg").hidden = true;
+    } catch (e) {     // never fail silently: say what is wrong
+      $("previewMsg").textContent = `לא הצלחתי להציג את הדוגמה (${(e && e.message) || e}). סגרו את הדף ופתחו אותו מחדש, ובדקו שיש אינטרנט.`;
+      $("previewMsg").hidden = false;
+    }
   });
 }
 const NAME_FIELDS = ["name1", "name2", "name3"];
@@ -342,7 +350,7 @@ $("sendName").addEventListener("click", async () => {
     $("title").focus();
     return;
   }
-  await assetsReady;
+  try { await ensureAssets(); } catch (e) { $("nameMsg").textContent = "לא הצלחתי לטעון את עיצוב הדף. בדקו שיש אינטרנט ונסו שוב."; return; }
   // Print-ready PDF: one A4-landscape page holding the page as a 300 dpi image.
   // No fonts or layout inside the PDF, so it prints identically on any printer.
   let pdf = null;
